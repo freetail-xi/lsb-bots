@@ -21,6 +21,9 @@
 #include "map/utils/zoneutils.h"
 #include "map/zone.h"
 
+#include <algorithm>
+#include <array>
+
 namespace bots
 {
 
@@ -28,6 +31,14 @@ namespace
 {
 
 constexpr auto kFieldZones = static_cast<uint16>(xi::ZoneType::Outdoors) | static_cast<uint16>(xi::ZoneType::Dungeon);
+
+// Zones from after the 75 era (June 2008 on): the Abyssea areas, and everything numbered 256 and up
+// (Adoulin, Escha, Reisenjima, Dynamis - Divergence...). A test-server login put a bot in Abyssea - La Theine.
+auto afterEra(const uint16 zoneId) -> bool
+{
+    static constexpr std::array<uint16, 10> abyssea = { 15, 45, 132, 215, 216, 217, 218, 253, 254, 255 };
+    return zoneId >= 256 || std::ranges::find(abyssea, zoneId) != abyssea.end();
+}
 
 auto isField(const CZone* PZone) -> bool
 {
@@ -43,7 +54,7 @@ auto findCamps(const uint8 level) -> std::vector<Place>
 
     for (auto& [zoneId, PZone] : g_PZoneList)
     {
-        if (PZone == nullptr || !isField(PZone))
+        if (PZone == nullptr || !isField(PZone) || afterEra(static_cast<uint16>(zoneId)))
         {
             continue;
         }
