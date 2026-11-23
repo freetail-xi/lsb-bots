@@ -286,6 +286,18 @@ class BotModule : public CPPModule
                     continue;
                 }
 
+                // Noted on the first tick in a zone, not in login(): early logins had no zone yet and wrote no line.
+                if (!bot.loginNoted && PChar->loc.zone != nullptr)
+                {
+                    bot.loginNoted = true;
+                    // Sessions log bots in often: a login replaces a previous login line, so the diary keeps real events.
+                    if (!bot.diary.empty() && bot.diary.back().text.starts_with("logged in at "))
+                    {
+                        bot.diary.pop_back();
+                    }
+                    bots::noteEvent(bot, fmt::format("logged in at {}", bots::prettyName(PChar->loc.zone->getName())));
+                }
+
                 if (PChar->GetMLevel() != bot.preparedLevel && !PChar->PAI->IsEngaged() && PChar->loc.zone != nullptr)
                 {
                     timed("prepare", [&] { bots::prepare(bot, lua); });
@@ -551,16 +563,6 @@ class BotModule : public CPPModule
         {
             db::preparedStmt("DELETE FROM accounts_sessions WHERE charid = ?", bot.charId);
             return;
-        }
-
-        if (auto* PChar = bot.entity(); PChar != nullptr && PChar->loc.zone != nullptr)
-        {
-            // Sessions log bots in often: a login replaces a previous login line, so the diary keeps real events.
-            if (!bot.diary.empty() && bot.diary.back().text.starts_with("logged in at "))
-            {
-                bot.diary.pop_back();
-            }
-            bots::noteEvent(bot, fmt::format("logged in at {}", bots::prettyName(PChar->loc.zone->getName())));
         }
 
         if (const auto minutes = sessionMinutes())

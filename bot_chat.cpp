@@ -697,8 +697,7 @@ auto describe(const Bot& bot, const bool places = false, const bool sentInvite =
     const auto* PChar = bot.entity();
     const auto  race  = PChar->look.race < races.size() ? races[PChar->look.race] : "Hume";
     const auto  job   = static_cast<std::size_t>(PChar->GetMJob());
-    auto        zone  = PChar->loc.zone ? PChar->loc.zone->getName() : std::string("somewhere");
-    std::ranges::replace(zone, '_', ' ');
+    const auto  zone  = PChar->loc.zone ? prettyName(PChar->loc.zone->getName()) : std::string("somewhere");
 
     const auto spaced = [](std::string text)
     {
@@ -1356,8 +1355,7 @@ auto partyShout(const CCharEntity* PChar) -> std::string
     const auto index = static_cast<std::size_t>(PChar->GetMJob());
     const auto abbr  = index < jobs.size() && jobs[index][0] != '\0' ? std::string(jobs[index]) : std::string("ADV");
     const auto level = static_cast<int>(PChar->GetMLevel());
-    auto       zone  = PChar->loc.zone->getName();
-    std::ranges::replace(zone, '_', ' ');
+    const auto zone  = prettyName(PChar->loc.zone->getName()); // "Southern San d'Oria", as !bots shows it
 
     switch (xirand::GetRandomNumber<uint32>(4))
     {

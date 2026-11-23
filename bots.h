@@ -174,6 +174,7 @@ struct Bot
     std::unique_ptr<MapSession> session;
     timer::time_point           diedAt{};
     bool                        deathNoted{};    // this death is already a diary line
+    bool                        loginNoted{};    // this login is already a diary line
     bool                        homeNoted{};     // the homepoint for this death is already a diary line
     bool                        withPlayer{};    // its party has had a real player in it
     uint8                       preparedLevel{}; // level its spells and gear were set for
