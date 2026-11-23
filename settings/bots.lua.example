@@ -20,6 +20,7 @@ xi.settings.bots =
     CAMP_CHANCE          = 70, -- Percent of logins that start at a camp for the bot's level instead of the pool home
     HUNT                 = true, -- Bots without a party hunt monsters near their level, in zones with real players
     BOT_PARTIES          = true, -- Unpartied bots in a zone with real players sometimes team up and hunt together
+    INVITE_SEEKERS       = true, -- A bot party at a camp, or in a fight, tells one seeking player it has room for, then invites. A tell of "no invites" stops that until restart
     PLAYER_LEEWAY        = 40, -- Yalms. Bots leave a real player's mobs alone inside this, and aren't placed this close. They still fight back
     LEVEL_WINDOW         = 10, -- Levels. Balance won't send a bot further than this from the player; invites use it, and logins prefer it
 

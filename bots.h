@@ -288,6 +288,7 @@ void walkTo(CCharEntity* PChar, const position_t& pos, float within, timer::time
 
 // bot_combat.cpp
 auto throttle(Bot& bot, uint32 key, uint32 targetId, timer::duration cooldown, timer::time_point tick) -> bool;
+auto isTank(xi::Job job) -> bool; // PLD, WAR, NIN, RUN
 auto isCaster(xi::Job job) -> bool;
 auto isRanged(CCharEntity* PChar) -> bool;  // a ranger or corsair that fights with its ranged weapon
 auto canShoot(CCharEntity* PChar) -> bool;  // any job with something to fire, enough to pull with
@@ -402,6 +403,8 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, ti
 void deliverChat(std::vector<Bot>& online, PacketSystem& packets);
 void callout(const Bot& bot, const std::string& text, bool macro);
 void tell(const Bot& bot, const std::string& to, const std::string& text);
+void refuseInvites(uint32 charId);       // a tell of "no invites": not asked again until the server restarts
+auto invitesRefused(uint32 charId) -> bool;
 void greet(const Bot& bot);
 auto partyChat(uint32 partyId) -> std::vector<std::string>; // the party's recent lines, "Name: text", oldest first
 

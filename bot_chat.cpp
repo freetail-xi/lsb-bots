@@ -96,6 +96,7 @@ std::map<uint32, uint8>            chattiness;    // main thread only, 0-100
 std::map<std::string, std::pair<uint32, timer::time_point>> partners;
 std::map<std::string, int>                                   botRuns;
 std::map<uint32, timer::time_point>                          quietUntil;
+std::set<uint32>                                             inviteRefused; // told a bot "no invites"; kept until the process ends
 
 constexpr auto kConversationWindow = std::chrono::seconds(90);
 constexpr int  kMaxBotRun          = 3;
@@ -601,6 +602,12 @@ auto feelsLikeTalking(const Bot& bot) -> bool
     return xirand::GetRandomNumber<uint32>(100) < chattinessOf(bot);
 }
 
+// "no invites", and the ways a player says the same thing. Whole words, so "invite" inside it is not a request to join.
+auto saysNoInvites(const std::string& text) -> bool
+{
+    return saysPhrase(lower(text), { "no invites", "no invite", "stop inviting", "dont invite", "don't invite", "do not invite", "stop invites", "no more invites" });
+}
+
 auto saysQuiet(const std::string& text) -> int
 {
     const auto t = lower(text);
@@ -972,6 +979,16 @@ auto pullerAnswer(const std::string& text, CCharEntity* PSpeaker, const std::vec
 
 } // namespace
 
+void refuseInvites(const uint32 charId)
+{
+    inviteRefused.insert(charId);
+}
+
+auto invitesRefused(const uint32 charId) -> bool
+{
+    return inviteRefused.contains(charId);
+}
+
 void startChat()
 {
     if (settings::get<bool>("bots.CHAT_ENABLED"))
@@ -1102,6 +1119,13 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
         }
         botRuns[channel] = 0;
 
+        // "no invites" and the same kind of tell. Recorded before any reply, and it stays for this process.
+        if (isTell(kind) && PSender != nullptr && !botNames.contains(from) && saysNoInvites(listeners.front().heard.text))
+        {
+            refuseInvites(PSender->id);
+            ShowInfoFmt("bots: {} asked not to be invited", from);
+        }
+
         if (const auto quiet = saysQuiet(listeners.front().heard.text); quiet != 0)
         {
             for (const auto& listener : listeners)
@@ -1231,7 +1255,7 @@ void respond(std::vector<Listener>& listeners)
                 }
                 continue;
             }
-            const bool party  = wantsParty(listener.heard.text);
+            const bool party  = wantsParty(listener.heard.text) && !saysNoInvites(listener.heard.text);
             const bool invite = party && levelNear(listener.bot->entity(), listener.heard.from);
             ask(*listener.bot, listener.heard, false, party && !invite ? "You have not sent them an invite." : "", !party || invite);
             if (invite)
@@ -1265,7 +1289,7 @@ void respond(std::vector<Listener>& listeners)
     {
         // Someone looking for a group out loud gets one invite, from a bot without a party whose level is close.
         // A bot further than LEVEL_WINDOW does not take that invite, and does not block one who is close enough.
-        const bool party   = wantsParty(listeners.front().heard.text);
+        const bool party   = wantsParty(listeners.front().heard.text) && !saysNoInvites(listeners.front().heard.text);
         auto       free    = listeners.end();
         bool       anyFree = false;
         if (party)

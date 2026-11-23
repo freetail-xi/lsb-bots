@@ -1146,10 +1146,11 @@ auto autoCamp(CCharEntity* PLeader, const bool withPlayer) -> bool
         return false;
     }
 
+    // The leader is eligible. A bard (or whoever pullerRank likes) who is leading should be the one who runs out.
     CBattleEntity* PPuller = nullptr;
     for (auto* PMember : PLeader->PParty->members)
     {
-        if (PMember != PLeader && isPoolChar(PMember->id) &&
+        if (isPoolChar(PMember->id) &&
             (PPuller == nullptr || pullerRank(PMember->GetMJob(), PMember->GetMLevel()) < pullerRank(PPuller->GetMJob(), PPuller->GetMLevel())))
         {
             PPuller = PMember;

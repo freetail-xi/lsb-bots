@@ -1691,11 +1691,6 @@ auto pets(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
     return std::ranges::any_of(bloodPacts(PPetEntity->petID()), [&](const uint16 id) { return tryAbility(bot, packets, id, PTarget, tick); });
 }
 
-auto isTank(const Job job) -> bool
-{
-    return job == Job::PLD || job == Job::WAR || job == Job::NIN || job == Job::RUN;
-}
-
 // A monster in the party beating on someone the tank should protect: a non-tank, or a tank getting low.
 auto strayMonster(CCharEntity* PChar) -> CBattleEntity*
 {
@@ -1794,6 +1789,11 @@ auto tank(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
 }
 
 } // namespace
+
+auto isTank(const xi::Job job) -> bool
+{
+    return job == xi::Job::PLD || job == xi::Job::WAR || job == xi::Job::NIN || job == xi::Job::RUN;
+}
 
 // Main tanks the party named, by party.
 std::map<uint32, uint32> tankChoices;

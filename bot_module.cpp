@@ -26,6 +26,7 @@
 #include "map/utils/moduleutils.h"
 #include "map/utils/petutils.h"
 #include "map/utils/zoneutils.h"
+#include "map/map_engine.h"
 #include "map/zone.h"
 
 #include <algorithm>
@@ -45,6 +46,212 @@ constexpr auto kPresenceInterval = std::chrono::seconds(5);
 constexpr auto kBalanceInterval  = std::chrono::seconds(30);
 constexpr auto kGroupingInterval = std::chrono::seconds(60);
 constexpr auto kSlowStep         = std::chrono::milliseconds(200);
+
+// formParties: already standing together, not pulled across the zone by follow.
+constexpr float kFormRange   = 40.0f;
+constexpr int   kFormLevels  = 5;
+constexpr uint8 kHealerLevel = 15; // at this level and up, a party needs a healer; below it, mages alone may still group
+
+constexpr auto kSeekInviteDelay = std::chrono::seconds(5); // the tell, then the invite
+constexpr auto kSeekerCooldown  = std::chrono::minutes(15);
+constexpr auto kLeaderCooldown  = std::chrono::minutes(40);
+
+// Same order partyHealer uses. It needs a party, and these bots are not in one yet.
+auto healerRank(const xi::Job job) -> int
+{
+    return job == xi::Job::WHM ? 2 : job == xi::Job::RDM || job == xi::Job::SCH ? 1 : 0;
+}
+
+// Same order mainTank uses, so the bot who leads is the one the party will treat as the tank.
+auto tankScore(const xi::Job job) -> int
+{
+    switch (job)
+    {
+        case xi::Job::PLD: return 3;
+        case xi::Job::NIN:
+        case xi::Job::RUN: return 2;
+        case xi::Job::WAR: return 1;
+        default: return 0;
+    }
+}
+
+auto chooseLeader(const std::vector<bots::Bot*>& cluster) -> bots::Bot*
+{
+    bots::Bot* tank = nullptr;
+    for (auto* bot : cluster)
+    {
+        auto* PChar = bot->entity();
+        if (PChar == nullptr || !bots::isTank(PChar->GetMJob()))
+        {
+            continue;
+        }
+        const auto score = tankScore(PChar->GetMJob());
+        if (tank == nullptr || score > tankScore(tank->entity()->GetMJob()) ||
+            (score == tankScore(tank->entity()->GetMJob()) && PChar->GetMLevel() > tank->entity()->GetMLevel()))
+        {
+            tank = bot;
+        }
+    }
+    if (tank != nullptr)
+    {
+        return tank;
+    }
+
+    bots::Bot* puller = nullptr;
+    for (auto* bot : cluster)
+    {
+        auto* PChar = bot->entity();
+        if (PChar == nullptr)
+        {
+            continue;
+        }
+        if (puller == nullptr ||
+            bots::pullerRank(PChar->GetMJob(), PChar->GetMLevel()) < bots::pullerRank(puller->entity()->GetMJob(), puller->entity()->GetMLevel()))
+        {
+            puller = bot;
+        }
+    }
+    return puller;
+}
+
+// Within 5 levels and 40 yalms of the leader-to-be.
+auto nearLeader(bots::Bot* leader, const std::vector<bots::Bot*>& bots) -> std::vector<bots::Bot*>
+{
+    std::vector<bots::Bot*> near;
+    auto*                   PLeader = leader->entity();
+    if (PLeader == nullptr)
+    {
+        return near;
+    }
+    for (auto* bot : bots)
+    {
+        auto* PChar = bot->entity();
+        if (PChar == nullptr)
+        {
+            continue;
+        }
+        if (std::abs(static_cast<int>(PChar->GetMLevel()) - static_cast<int>(PLeader->GetMLevel())) <= kFormLevels &&
+            distance(PChar->loc.p, PLeader->loc.p) < kFormRange)
+        {
+            near.push_back(bot);
+        }
+    }
+    return near;
+}
+
+// Tank, then one healer, then everyone else (better pullers first), up to 6.
+// Empty when a party whose highest member is 15 or more would have no healer.
+auto fillParty(const std::vector<bots::Bot*>& pool) -> std::vector<bots::Bot*>
+{
+    if (pool.size() < 2)
+    {
+        return {};
+    }
+
+    auto* leader = chooseLeader(pool);
+    if (leader == nullptr)
+    {
+        return {};
+    }
+
+    const auto near = nearLeader(leader, pool);
+    if (near.size() < 2)
+    {
+        return {};
+    }
+
+    uint8 highest = 0;
+    bool  healer  = false;
+    for (auto* bot : near)
+    {
+        highest = std::max(highest, static_cast<uint8>(bot->entity()->GetMLevel()));
+        healer  = healer || healerRank(bot->entity()->GetMJob()) > 0;
+    }
+    if (highest >= kHealerLevel && !healer)
+    {
+        return {};
+    }
+
+    std::vector<bots::Bot*> group{ leader };
+    bots::Bot*              bestHealer = nullptr;
+    for (auto* bot : near)
+    {
+        if (bot == leader || healerRank(bot->entity()->GetMJob()) == 0)
+        {
+            continue;
+        }
+        if (bestHealer == nullptr || healerRank(bot->entity()->GetMJob()) > healerRank(bestHealer->entity()->GetMJob()) ||
+            (healerRank(bot->entity()->GetMJob()) == healerRank(bestHealer->entity()->GetMJob()) &&
+             bot->entity()->GetMLevel() > bestHealer->entity()->GetMLevel()))
+        {
+            bestHealer = bot;
+        }
+    }
+    if (bestHealer != nullptr)
+    {
+        group.push_back(bestHealer);
+    }
+
+    std::vector<bots::Bot*> rest;
+    for (auto* bot : near)
+    {
+        if (bot != leader && bot != bestHealer)
+        {
+            rest.push_back(bot);
+        }
+    }
+    std::ranges::sort(rest, [](const bots::Bot* a, const bots::Bot* b)
+                      {
+                          const auto ra = bots::pullerRank(a->entity()->GetMJob(), a->entity()->GetMLevel());
+                          const auto rb = bots::pullerRank(b->entity()->GetMJob(), b->entity()->GetMLevel());
+                          if (ra != rb)
+                          {
+                              return ra < rb;
+                          }
+                          return a->entity()->GetMLevel() > b->entity()->GetMLevel();
+                      });
+    for (auto* bot : rest)
+    {
+        if (group.size() >= 6)
+        {
+            break;
+        }
+        group.push_back(bot);
+    }
+    return group;
+}
+
+auto partyFrom(bots::Bot* seed, const std::vector<bots::Bot*>& zoneBots) -> std::vector<bots::Bot*>
+{
+    const auto around = nearLeader(seed, zoneBots);
+    if (auto group = fillParty(around); !group.empty())
+    {
+        return group;
+    }
+
+    // The zone's only real cluster is mages under 15, or a high bot with no healer is standing with them.
+    // The low ones still get a party.
+    std::vector<bots::Bot*> low;
+    for (auto* bot : around)
+    {
+        if (bot->entity() != nullptr && bot->entity()->GetMLevel() < kHealerLevel)
+        {
+            low.push_back(bot);
+        }
+    }
+    return fillParty(low);
+}
+
+auto jobAbbr(const xi::Job job) -> std::string
+{
+    static constexpr std::array<const char*, 23> jobs = {
+        "", "WAR", "MNK", "WHM", "BLM", "RDM", "THF", "PLD", "DRK", "BST", "BRD", "RNG",
+        "SAM", "NIN", "DRG", "SMN", "BLU", "COR", "PUP", "DNC", "SCH", "GEO", "RUN",
+    };
+    const auto index = static_cast<std::size_t>(job);
+    const auto abbr  = index < jobs.size() && jobs[index][0] != '\0' ? std::string(jobs[index]) : std::string("DD");
+    return bots::lowerCase(abbr);
+}
 
 } // namespace
 
@@ -234,6 +441,17 @@ class BotModule : public CPPModule
             formParties();
         }
 
+        if (wanted && now >= nextSeek_)
+        {
+            nextSeek_ = now + std::chrono::seconds(30 + xirand::GetRandomNumber<uint32>(31));
+            askSeekers(now);
+        }
+
+        if (wanted)
+        {
+            sendDueInvites(now);
+        }
+
         if (const auto minutes = settings::get<uint32>("bots.ROTATE_MINUTES"); wanted && minutes > 0 && now >= nextRotate_)
         {
             if (nextRotate_ != timer::time_point{})
@@ -391,7 +609,9 @@ class BotModule : public CPPModule
         login(*entry);
     }
 
-    // Unpartied bots in a zone with real players sometimes team up: within 5 levels, 2 to 6 of them.
+    // Unpartied bots in a zone with real players sometimes team up: within 5 levels and 40 yalms of the
+    // leader, tank then healer then damage, 2 to 6. The tank (or the best puller, when there is no tank)
+    // sends the invites, and so leads when they are accepted. Below 15 the party may be mages only.
     void formParties()
     {
         if (!settings::get<bool>("bots.BOT_PARTIES"))
@@ -418,15 +638,16 @@ class BotModule : public CPPModule
                 continue;
             }
 
-            std::ranges::sort(bots, [](const bots::Bot* a, const bots::Bot* b) { return a->entity()->GetMLevel() < b->entity()->GetMLevel(); });
-            const auto start = xirand::GetRandomNumber<std::size_t>(bots.size());
-            std::vector<bots::Bot*> group{ bots[start] };
-            for (auto* bot : bots)
+            auto seeds = bots;
+            std::ranges::shuffle(seeds, std::mt19937{ xirand::GetRandomNumber<uint32>(std::numeric_limits<uint32>::max()) });
+
+            std::vector<bots::Bot*> group;
+            for (auto* seed : seeds)
             {
-                if (bot != bots[start] && group.size() < 6 &&
-                    std::abs(static_cast<int>(bot->entity()->GetMLevel()) - static_cast<int>(bots[start]->entity()->GetMLevel())) <= 5)
+                group = partyFrom(seed, bots);
+                if (group.size() >= 2)
                 {
-                    group.push_back(bot);
+                    break;
                 }
             }
             if (group.size() < 2)
@@ -441,6 +662,190 @@ class BotModule : public CPPModule
             }
             ShowInfoFmt("bots: {} is forming a party of {} in zone {}", leader->name, group.size(), zone);
         }
+    }
+
+    // One seeking player, told once, then invited a few seconds later. Parties that already have a camp or a fight.
+    void askSeekers(const timer::time_point now)
+    {
+        if (!settings::get<bool>("bots.INVITE_SEEKERS"))
+        {
+            return;
+        }
+
+        struct Offer
+        {
+            bots::Bot* leader{};
+            uint8      lo{};
+            uint8      hi{};
+            bool       needTank{};
+            bool       needHealer{};
+            bool       needDamage{};
+        };
+
+        std::vector<Offer> offers;
+        for (auto& bot : online_)
+        {
+            auto* PChar = bot.entity();
+            if (PChar == nullptr || PChar->loc.zone == nullptr || PChar->PParty == nullptr || PChar->PParty->GetLeader() != PChar || PChar->PParty->IsFull() ||
+                !bot.invites.empty())
+            {
+                continue;
+            }
+            if (const auto asked = leaderAsked_.find(bot.charId); asked != leaderAsked_.end() && now < asked->second)
+            {
+                continue;
+            }
+
+            const bool hunting = std::ranges::any_of(PChar->PParty->members, [](const CBattleEntity* PMember)
+                                                     {
+                                                         return PMember->PAI->IsEngaged() && PMember->GetBattleTarget() != nullptr && PMember->GetBattleTarget()->objtype == TYPE_MOB;
+                                                     });
+            if (!bots::campSpot(PChar) && !hunting)
+            {
+                continue;
+            }
+
+            bool  hasTank   = false;
+            bool  hasHealer = false;
+            uint8 lo        = 255;
+            uint8 hi        = 0;
+            for (auto* PMember : PChar->PParty->members)
+            {
+                lo = std::min(lo, static_cast<uint8>(PMember->GetMLevel()));
+                hi = std::max(hi, static_cast<uint8>(PMember->GetMLevel()));
+                if (!hasTank && bots::isTank(PMember->GetMJob()))
+                {
+                    hasTank = true;
+                }
+            }
+            if (const auto* PHealer = bots::partyHealer(PChar); PHealer != nullptr && PHealer->objtype != TYPE_TRUST)
+            {
+                hasHealer = true;
+            }
+
+            offers.push_back(Offer{ &bot, lo, hi, !hasTank, !hasHealer, hasTank && hasHealer });
+        }
+        if (offers.empty())
+        {
+            return;
+        }
+
+        std::vector<CCharEntity*> seekers;
+        for (auto& zone : g_PZoneList)
+        {
+            auto& PZone = zone.second;
+            if (PZone == nullptr || (static_cast<uint16>(PZone->GetTypeMask()) & static_cast<uint16>(xi::ZoneType::Instanced)) != 0)
+            {
+                continue;
+            }
+
+            PZone->ForEachChar(
+                [&](CCharEntity* PChar)
+                {
+                    if (bots::isPoolChar(PChar->id) || PChar->inMogHouse() || PChar->status != xi::Status::Normal || PChar->PParty != nullptr || PChar->isDead() ||
+                        PChar->PAI->IsEngaged() || !PChar->isSeekingParty() || bots::invitesRefused(PChar->id))
+                    {
+                        return;
+                    }
+                    if (const auto asked = seekerAsked_.find(PChar->id); asked != seekerAsked_.end() && now < asked->second)
+                    {
+                        return;
+                    }
+                    seekers.push_back(PChar);
+                });
+        }
+        if (seekers.empty())
+        {
+            return;
+        }
+
+        std::ranges::shuffle(offers, std::mt19937{ xirand::GetRandomNumber<uint32>(std::numeric_limits<uint32>::max()) });
+        std::ranges::shuffle(seekers, std::mt19937{ xirand::GetRandomNumber<uint32>(std::numeric_limits<uint32>::max()) });
+
+        const auto window = static_cast<int>(settings::get<uint32>("bots.LEVEL_WINDOW"));
+        for (const auto& offer : offers)
+        {
+            auto* PLeader = offer.leader->entity();
+            if (PLeader == nullptr || PLeader->loc.zone == nullptr)
+            {
+                continue;
+            }
+
+            // One tell. A missing tank beats a missing healer, which beats another damage dealer.
+            CCharEntity* picked = nullptr;
+            int          place  = 3;
+            for (auto* PPlayer : seekers)
+            {
+                const auto level = static_cast<int>(PPlayer->GetMLevel());
+                if (level < static_cast<int>(offer.lo) - window || level > static_cast<int>(offer.hi) + window)
+                {
+                    continue;
+                }
+
+                const auto job    = PPlayer->GetMJob();
+                const bool tank   = bots::isTank(job);
+                const bool healer = healerRank(job) > 0;
+                int        role   = 3;
+                if (tank && offer.needTank)
+                {
+                    role = 0;
+                }
+                else if (healer && offer.needHealer)
+                {
+                    role = 1;
+                }
+                else if (!tank && !healer && offer.needDamage)
+                {
+                    role = 2;
+                }
+                if (role < place)
+                {
+                    picked = PPlayer;
+                    place  = role;
+                }
+            }
+            if (picked == nullptr)
+            {
+                continue;
+            }
+
+            const auto band = offer.lo == offer.hi ? fmt::format("{}", offer.lo) : fmt::format("{}-{}", offer.lo, offer.hi);
+            const auto line = fmt::format("hi, need a {} for {} in {}, want to join?", jobAbbr(picked->GetMJob()), band,
+                                          bots::lowerCase(bots::prettyName(PLeader->loc.zone->getName())));
+            bots::tell(*offer.leader, picked->getName(), line);
+            dueInvites_.push_back(DueInvite{ offer.leader->charId, picked->getName(), now + kSeekInviteDelay });
+            seekerAsked_[picked->id]           = now + kSeekerCooldown;
+            leaderAsked_[offer.leader->charId] = now + kLeaderCooldown;
+            ShowInfoFmt("bots: {} asks {}: {}", offer.leader->name, picked->getName(), line);
+            return;
+        }
+    }
+
+    // The invite goes out a few seconds after the tell, through the same queue formParties uses.
+    void sendDueInvites(const timer::time_point now)
+    {
+        std::erase_if(dueInvites_,
+                      [&](const DueInvite& due)
+                      {
+                          if (now < due.when)
+                          {
+                              return false;
+                          }
+
+                          const auto bot = std::ranges::find_if(online_, [&](const bots::Bot& candidate) { return candidate.charId == due.charId; });
+                          if (bot != online_.end() && bot->entity() != nullptr)
+                          {
+                              auto*       PLeader = bot->entity();
+                              const auto* PPlayer = zoneutils::GetCharByName(due.name);
+                              const bool  canLead = PLeader->PParty == nullptr || (PLeader->PParty->GetLeader() == PLeader && !PLeader->PParty->IsFull());
+                              if (PPlayer != nullptr && PPlayer->PParty == nullptr && !bots::invitesRefused(PPlayer->id) && canLead &&
+                                  !std::ranges::contains(bot->invites, due.name))
+                              {
+                                  bot->invites.push_back(due.name);
+                              }
+                          }
+                          return true;
+                      });
     }
 
     // Bots rotated out sit out a while, unless nobody else is left.
@@ -827,6 +1232,16 @@ class BotModule : public CPPModule
     timer::time_point             nextRotate_{};
     timer::time_point             nextBalance_{};
     timer::time_point             nextGrouping_{};
+    timer::time_point             nextSeek_{};
+    struct DueInvite
+    {
+        uint32            charId{};
+        std::string       name;
+        timer::time_point when{};
+    };
+    std::vector<DueInvite>              dueInvites_;
+    std::map<uint32, timer::time_point> seekerAsked_; // real player char id, not asked again until this time
+    std::map<uint32, timer::time_point> leaderAsked_; // bot leader char id
     std::map<uint32, timer::time_point> resting_; // rotated-out bots and when they may return
 };
 
