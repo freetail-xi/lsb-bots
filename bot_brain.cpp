@@ -26,11 +26,14 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <system_error>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -169,7 +172,13 @@ private:
                     {
                         return std::nullopt;
                     }
-                    const auto code = std::stoi(text_.substr(at_ + 1, 4), nullptr, 16);
+                    int code = 0;
+                    const auto* const first = text_.data() + at_ + 1;
+                    const auto [ptr, ec]    = std::from_chars(first, first + 4, code, 16);
+                    if (ec != std::errc{} || ptr != first + 4)
+                    {
+                        return std::nullopt;
+                    }
                     out += code < 0x80 ? static_cast<char>(code) : '?';
                     at_ += 4;
                     break;
@@ -363,66 +372,80 @@ void worker()
             shared.jobs.pop_front();
         }
 
-        Result                                           result{ .id = job.id };
-        const auto                                       timeout  = std::max(5, settings::get<int32>("bots.LLM_TIMEOUT"));
-        const auto                                       deadline = timer::now() + std::chrono::seconds(timeout);
-        std::string                                      more; // later rounds: the calls so far and their results
-        std::vector<std::pair<std::string, std::string>> seen; // name and arguments of each call
-        for (int round = 0; round < kMaxRounds; ++round)
+        Result result{ .id = job.id };
+        try
         {
-            const auto left = std::chrono::duration_cast<std::chrono::seconds>(deadline - timer::now()).count();
-            if (round > 0 && left < 3)
+            const auto                                       timeout  = std::max(5, settings::get<int32>("bots.LLM_TIMEOUT"));
+            const auto                                       deadline = timer::now() + std::chrono::seconds(timeout);
+            std::string                                      more; // later rounds: the calls so far and their results
+            std::vector<std::pair<std::string, std::string>> seen; // name and arguments of each call
+            for (int round = 0; round < kMaxRounds; ++round)
             {
-                break;
-            }
-            const auto reply = httpPost(settings::get<std::string>("bots.LLM_URL"), settings::get<std::string>("bots.LLM_API_KEY"), job.head + more + job.tail,
-                                        round == 0 ? timeout : static_cast<int32>(left));
-            const auto json  = reply.status == 200 ? JsonReader(reply.body).read() : std::nullopt;
-            const auto* message = json && json->get("choices") && json->get("choices")->at(0) ? json->get("choices")->at(0)->get("message") : nullptr;
-            if (message == nullptr)
-            {
-                if (round == 0)
+                const auto left = std::chrono::duration_cast<std::chrono::seconds>(deadline - timer::now()).count();
+                if (round > 0 && left < 3)
                 {
-                    ShowWarningFmt("bots: the party brain got no usable answer (HTTP {}): {}", reply.status, reply.body.substr(0, 200));
+                    break;
                 }
-                break;
-            }
-            result.answered = true;
+                const auto reply = httpPost(settings::get<std::string>("bots.LLM_URL"), settings::get<std::string>("bots.LLM_API_KEY"), job.head + more + job.tail,
+                                            round == 0 ? timeout : static_cast<int32>(left));
+                const auto json  = reply.status == 200 ? JsonReader(reply.body).read() : std::nullopt;
+                const auto* message = json && json->get("choices") && json->get("choices")->at(0) ? json->get("choices")->at(0)->get("message") : nullptr;
+                if (message == nullptr)
+                {
+                    if (round == 0)
+                    {
+                        ShowWarningFmt("bots: the party brain got no usable answer (HTTP {}): {}", reply.status, reply.body.substr(0, 200));
+                    }
+                    break;
+                }
+                result.answered = true;
 
-            const auto* calls = message->get("tool_calls");
-            int         real     = 0;
-            bool        repeated = false;
-            for (std::size_t i = 0; calls != nullptr && i < calls->size(); ++i)
-            {
-                const auto* function = calls->at(i)->get("function");
-                if (function == nullptr || function->get("name") == nullptr)
+                const auto* calls = message->get("tool_calls");
+                int         real     = 0;
+                bool        repeated = false;
+                for (std::size_t i = 0; calls != nullptr && i < calls->size(); ++i)
                 {
-                    continue;
+                    const auto* function = calls->at(i)->get("function");
+                    if (function == nullptr || function->get("name") == nullptr)
+                    {
+                        continue;
+                    }
+                    // Arguments come as a JSON string holding a JSON object.
+                    const auto name = function->get("name")->str();
+                    const auto text = function->get("arguments") ? function->get("arguments")->str() : std::string("{}");
+                    if (round > 0 && (name == "no_action" || std::ranges::contains(seen, std::pair{ name, text })))
+                    {
+                        repeated = repeated || name != "no_action";
+                        continue;
+                    }
+                    auto args = JsonReader(text.empty() ? std::string("{}") : text).read();
+                    result.calls.push_back(ToolCall{ name, args ? std::move(*args) : Json{ Json::Object{} } });
+                    seen.emplace_back(name, text);
+                    real += name != "no_action";
                 }
-                // Arguments come as a JSON string holding a JSON object.
-                const auto name = function->get("name")->str();
-                const auto text = function->get("arguments") ? function->get("arguments")->str() : std::string("{}");
-                if (round > 0 && (name == "no_action" || std::ranges::contains(seen, std::pair{ name, text })))
+                if (calls == nullptr || calls->size() != 1 || real != 1 || repeated)
                 {
-                    repeated = repeated || name != "no_action";
-                    continue;
+                    break;
                 }
-                auto args = JsonReader(text.empty() ? std::string("{}") : text).read();
-                result.calls.push_back(ToolCall{ name, args ? std::move(*args) : Json{ Json::Object{} } });
-                seen.emplace_back(name, text);
-                real += name != "no_action";
-            }
-            if (calls == nullptr || calls->size() != 1 || real != 1 || repeated)
-            {
-                break;
-            }
 
-            const auto* call      = calls->at(0);
-            const auto  id        = call->get("id") ? call->get("id")->str() : std::string("call_0");
-            const auto  reasoning = message->get("reasoning_content") ? message->get("reasoning_content")->str() : std::string{};
-            more += fmt::format(R"(,{{"role":"assistant","content":"","reasoning_content":"{}","tool_calls":[{{"id":"{}","type":"function","function":{{"name":"{}","arguments":"{}"}}}}]}})",
-                                escape(reasoning), escape(id), escape(seen.back().first), escape(seen.back().second));
-            more += fmt::format(R"(,{{"role":"tool","tool_call_id":"{}","content":"{}"}})", escape(id), kDone);
+                const auto* call      = calls->at(0);
+                const auto  id        = call->get("id") ? call->get("id")->str() : std::string("call_0");
+                const auto  reasoning = message->get("reasoning_content") ? message->get("reasoning_content")->str() : std::string{};
+                more += fmt::format(R"(,{{"role":"assistant","content":"","reasoning_content":"{}","tool_calls":[{{"id":"{}","type":"function","function":{{"name":"{}","arguments":"{}"}}}}]}})",
+                                    escape(reasoning), escape(id), escape(seen.back().first), escape(seen.back().second));
+                more += fmt::format(R"(,{{"role":"tool","tool_call_id":"{}","content":"{}"}})", escape(id), kDone);
+            }
+        }
+        catch (const std::exception& err)
+        {
+            // answered stays false so handleChat falls back to planOrder for this waiting entry.
+            ShowErrorFmt("bots: party brain request failed: {}", err.what());
+            result = Result{ .id = job.id };
+        }
+        catch (...)
+        {
+            ShowErrorFmt("bots: party brain request failed");
+            result = Result{ .id = job.id };
         }
 
         std::lock_guard lock(shared.mutex);

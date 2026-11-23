@@ -35,6 +35,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -251,7 +252,9 @@ auto wantsParty(const std::string& text) -> bool
                                    for (auto at = lowered.find(word); at != std::string::npos; at = lowered.find(word, at + 1))
                                    {
                                        const bool startOk = at == 0 || !std::isalpha(static_cast<unsigned char>(lowered[at - 1]));
-                                       if (startOk)
+                                       const auto end     = at + word.size();
+                                       const bool endOk   = end >= lowered.size() || !std::isalpha(static_cast<unsigned char>(lowered[end]));
+                                       if (startOk && endOk)
                                        {
                                            return true;
                                        }
@@ -485,34 +488,46 @@ void worker()
             shared.requests.pop_front();
         }
 
-        const auto result  = httpPost(settings::get<std::string>("bots.LLM_URL"), settings::get<std::string>("bots.LLM_API_KEY"), request.body,
-                                      std::max(5, settings::get<int32>("bots.LLM_TIMEOUT")));
-        const auto content = result.status == 200 ? jsonString(result.body, "content", result.body.find("\"message\"")) : std::nullopt;
-        if (!content)
+        try
         {
-            if (timer::now() - lastWarning > std::chrono::minutes(1))
+            const auto result  = httpPost(settings::get<std::string>("bots.LLM_URL"), settings::get<std::string>("bots.LLM_API_KEY"), request.body,
+                                          std::max(5, settings::get<int32>("bots.LLM_TIMEOUT")));
+            const auto content = result.status == 200 ? jsonString(result.body, "content", result.body.find("\"message\"")) : std::nullopt;
+            if (!content)
             {
-                lastWarning = timer::now();
-                ShowWarningFmt("bots: no reply from the chat model at {} (HTTP {}): {}", settings::get<std::string>("bots.LLM_URL"), result.status,
-                               result.body.substr(0, 300));
+                if (timer::now() - lastWarning > std::chrono::minutes(1))
+                {
+                    lastWarning = timer::now();
+                    ShowWarningFmt("bots: no reply from the chat model at {} (HTTP {}): {}", settings::get<std::string>("bots.LLM_URL"), result.status,
+                                   result.body.substr(0, 300));
+                }
+                continue;
             }
-            continue;
-        }
 
-        // The stay-quiet answer, however it's spaced or punctuated: "PASS", "pass.", or the older "(none)".
-        std::string letters;
-        std::ranges::copy_if(lower(*content), std::back_inserter(letters), [](const unsigned char c) { return std::isalpha(c); });
-        auto text = tidy(*content, request.name);
-        if (text.empty() || letters == "pass" || letters == "none")
+            // The stay-quiet answer, however it's spaced or punctuated: "PASS", "pass.", or the older "(none)".
+            std::string letters;
+            std::ranges::copy_if(lower(*content), std::back_inserter(letters), [](const unsigned char c) { return std::isalpha(c); });
+            auto text = tidy(*content, request.name);
+            if (text.empty() || letters == "pass" || letters == "none")
+            {
+                continue;
+            }
+
+            // Roughly typing speed.
+            const auto delay = std::chrono::milliseconds(std::min(4000, 400 + 35 * static_cast<int>(text.size())));
+
+            std::lock_guard lock(shared.mutex);
+            shared.replies.push_back(Reply{ request.charId, request.kind, std::move(request.to), std::move(text), timer::now() + delay });
+        }
+        catch (const std::exception& err)
         {
-            continue;
+            // No reply: the same as a model miss, and the worker stays up for the next request.
+            ShowErrorFmt("bots: chat request failed: {}", err.what());
         }
-
-        // Roughly typing speed.
-        const auto delay = std::chrono::milliseconds(std::min(4000, 400 + 35 * static_cast<int>(text.size())));
-
-        std::lock_guard lock(shared.mutex);
-        shared.replies.push_back(Reply{ request.charId, request.kind, std::move(request.to), std::move(text), timer::now() + delay });
+        catch (...)
+        {
+            ShowErrorFmt("bots: chat request failed");
+        }
     }
 }
 
@@ -767,7 +782,7 @@ auto describe(const Bot& bot, const bool places = false) -> std::string
     const auto sub = PChar->GetSJob() != xi::Job::NONE && PChar->GetSLevel() > 0
                          ? fmt::format("{} subjob level {}", static_cast<std::size_t>(PChar->GetSJob()) < jobs.size() ? jobs[static_cast<std::size_t>(PChar->GetSJob())] : "?",
                                        PChar->GetSLevel())
-                         : std::string("no subjob yet (they come at level 18)");
+                         : fmt::format("no subjob yet (they come at level {})", settings::get<uint8>("main.SUBJOB_QUEST_LEVEL"));
     return fmt::format("You're {0}, playing Final Fantasy XI on a small private server: {1} {2} level {3}, {11}, from {9}.\n"
                        "Right now: {4}, {5}.{6}\n"
                        "{10}{7}\n"
@@ -1057,7 +1072,7 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
         // Bots answer each other too, but only now and then, one at a time, and a run of bot-only lines ends
         // after a few; a real player speaking starts the count over.
         const auto channel = PSender == nullptr ? std::string{}
-                             : isParty(kind)    ? fmt::format("party {}", fmt::ptr(PSender->PParty))
+                             : isParty(kind)    ? fmt::format("party {}", PSender->PParty != nullptr ? PSender->PParty->GetPartyID() : 0)
                              : isGroup(kind)    ? std::string("linkshell")
                                                 : fmt::format("zone {}", PSender->getZone());
         if (botNames.contains(from))
@@ -1306,7 +1321,7 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, co
         return std::chrono::seconds(xirand::GetRandomNumber<uint32>(minutes * 30, minutes * 90 + 1));
     };
 
-    static std::map<const CParty*, timer::time_point> partyQuietUntil;
+    static std::map<uint32, timer::time_point> partyQuietUntil;
 
     // Now and then someone in the linkshell says something, while a real player is in it.
     static timer::time_point nextLinkshell{};
@@ -1357,7 +1372,7 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, co
 
         if (PChar->PParty != nullptr && bot.withPlayer && partyMinutes > 0)
         {
-            auto& quiet         = partyQuietUntil[PChar->PParty];
+            auto& quiet         = partyQuietUntil[PChar->PParty->GetPartyID()];
             const bool afterFight = bot.foughtAt != timer::time_point{} && tick - bot.foughtAt < std::chrono::seconds(10) && !PChar->PAI->IsEngaged();
             if (tick < quiet || (tick < bot.nextChatter && !(afterFight && xirand::GetRandomNumber<uint32>(100) < 2)))
             {

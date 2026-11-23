@@ -912,7 +912,10 @@ auto inspect(const Bot& bot) -> std::vector<std::string>
         return { fmt::format("{} isn't online.", bot.name) };
     }
 
-    static constexpr std::array<const char*, 11> orders = { "cast", "provoke", "attack", "stop", "rest", "stay", "follow", "pull", "stop pulling", "camp", "assist" };
+    static constexpr std::array<const char*, static_cast<std::size_t>(OrderKind::Ability) + 1> orders = {
+        "cast", "provoke", "attack", "stop", "rest", "stay", "follow", "pull", "stop pulling", "camp", "assist", "ability",
+    };
+    static_assert(orders.back() != nullptr, "one name per OrderKind");
 
     auto* PLeader = leaderOf(PChar);
     auto* PTarget = PChar->GetBattleTarget();
@@ -1019,7 +1022,7 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
 
             if (PCaster != nullptr)
             {
-                ShowInfoFmt("bots: emote from {}: target {} index {}, caster index {}, emote {}, mode {}, param {}", PCaster->getName(), target,
+                ShowDebugFmt("bots: emote from {}: target {} index {}, caster index {}, emote {}, mode {}, param {}", PCaster->getName(), target,
                             packet->ref<uint16>(payload + offsetof(Data, TarActIndex)), packet->ref<uint16>(payload + offsetof(Data, CasActIndex)),
                             static_cast<uint16>(theirs), static_cast<uint8>(packet->ref<uint8>(payload + offsetof(Data, Mode))),
                             packet->ref<uint16>(payload + offsetof(Data, Param)));

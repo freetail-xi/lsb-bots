@@ -20,6 +20,7 @@
 #include <array>
 #include <charconv>
 #include <memory>
+#include <system_error>
 
 namespace bots
 {
@@ -201,14 +202,26 @@ auto dechunk(const std::string& body) -> std::string
         }
 
         std::size_t size = 0;
-        std::from_chars(body.data() + at, body.data() + lineEnd, size, 16);
-        if (size == 0)
+        const auto [ptr, ec] = std::from_chars(body.data() + at, body.data() + lineEnd, size, 16);
+        // A short or corrupt chunk used to throw from append; stop instead.
+        if (ec != std::errc{} || ptr == body.data() + at || size == 0)
         {
             break;
         }
 
-        out.append(body, lineEnd + 2, size);
-        at = lineEnd + 2 + size + 2;
+        const auto dataAt = lineEnd + 2;
+        if (dataAt > body.size() || size > body.size() - dataAt)
+        {
+            break;
+        }
+
+        out.append(body, dataAt, size);
+        at = dataAt + size;
+        if (at + 2 > body.size())
+        {
+            break;
+        }
+        at += 2;
     }
     return out;
 }
