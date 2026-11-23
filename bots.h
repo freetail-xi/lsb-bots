@@ -52,6 +52,13 @@ struct PoolEntry
     uint8       level{};
 };
 
+// One true thing that happened to a bot. Newest last in the diary, at most 8.
+struct DiaryLine
+{
+    int64       at{}; // unix seconds; the prompt turns this into "earlier today" or "yesterday"
+    std::string text;
+};
+
 // A zone and a spot in it.
 struct Place
 {
@@ -166,12 +173,15 @@ struct Bot
     uint8                       job{};
     std::unique_ptr<MapSession> session;
     timer::time_point           diedAt{};
+    bool                        deathNoted{};    // this death is already a diary line
+    bool                        homeNoted{};     // the homepoint for this death is already a diary line
     bool                        withPlayer{};    // its party has had a real player in it
     uint8                       preparedLevel{}; // level its spells and gear were set for
     position_t                  home{};          // where it logged in, for idle wandering
     timer::time_point           nextWander{};
     position_t                  leaderLast{};    // leader position last tick, to tell when they stop
-    bool                        seeking{};       // the /sea seeking-party flag is on
+    bool                        seeking{};        // the /sea seeking-party flag is on
+    bool                        seekingApplied{}; // this login has sent that flag since the character was loaded
     std::vector<Heard>          heard;           // chat received this tick, for bot_chat.cpp
     position_t                  settledAt{};     // where it was last put on the ground
     std::vector<std::string>    invites;         // people to invite, one per tick: players who asked, or bots it's grouping with
@@ -206,6 +216,8 @@ struct Bot
     timer::time_point           songWalkUntil{}; // while walking to sing, it isn't held at casting distance
     Directives                  directives;      // what the party told it to keep doing or stop doing
     bool                        directed{};      // carrying out one of them: what it was told to stop doesn't apply
+    timer::time_point           sessionEnds{};   // log out after this, once the bot is free; unset means no session limit
+    std::deque<DiaryLine>       diary;           // oldest first, capped at 8; the bot_pool.diary column
 
     auto entity() const -> CCharEntity*;
 };
@@ -255,6 +267,9 @@ void clearStaleState();
 auto countRealPlayers() -> uint32;
 void registerPoolChar(uint32 charId);
 auto isPoolChar(uint32 charId) -> bool;
+void loadDiary(Bot& bot);                  // the column loadPool read, onto this bot
+void noteEvent(Bot& bot, std::string fact); // one short line, newest last, saved to bot_pool.diary
+auto recentEvents(const Bot& bot) -> std::string; // newest 2-3 lines for the prompt; empty when there are none
 
 // bot_ai.cpp
 void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, bool active, timer::time_point tick);

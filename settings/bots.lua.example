@@ -13,6 +13,8 @@ xi.settings.bots =
     LOGIN_INTERVAL = 8,   -- Seconds between bot logins
     LOGOUT_GRACE   = 180, -- Seconds after the last real player leaves before the bots go
     ROTATE_MINUTES = 20,  -- Every this many minutes one bot outside a party swaps for another. 0 turns it off
+    SESSION_MIN    = 20,  -- Minutes. Each login rolls a session at least this long
+    SESSION_MAX    = 120, -- Minutes. And at most this long. At the end the bot logs out once it is free. 0 turns sessions off
 
     BOTS_PER_PLAYER_ZONE = 3,  -- Bots outside a party kept in every zone a real player is in. 0 turns it off
     CAMP_CHANCE          = 70, -- Percent of logins that start at a camp for the bot's level instead of the pool home

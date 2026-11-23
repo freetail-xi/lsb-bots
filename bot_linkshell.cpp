@@ -121,6 +121,7 @@ void linkshellUpkeep(Bot& bot, sol::state& lua, const timer::time_point tick)
     }
 
     // Players who asked for one; names are letters only, so they go into the script as they are.
+    std::vector<std::string> given;
     for (const auto& player : bot.pearlFor)
     {
         auto* PPlayer = zoneutils::GetCharByName(player);
@@ -131,6 +132,7 @@ void linkshellUpkeep(Bot& bot, sol::state& lua, const timer::time_point tick)
         }
         script += fmt::format("do local p = GetPlayerByName('{}'); if p ~= nil then p:addLinkpearl(ls, false) end end\n", player);
         ShowInfoFmt("bots: {} gives {} a linkpearl", bot.name, player);
+        given.push_back(player);
     }
     bot.pearlFor.clear();
 
@@ -138,6 +140,13 @@ void linkshellUpkeep(Bot& bot, sol::state& lua, const timer::time_point tick)
     {
         const sol::error err = result;
         ShowErrorFmt("bots: linkpearls for {} failed: {}", bot.name, err.what());
+    }
+    else
+    {
+        for (const auto& player : given)
+        {
+            noteEvent(bot, fmt::format("gave {} a linkpearl", player));
+        }
     }
 
     // Worn in the first slot, the way addLinkpearl equips the second.

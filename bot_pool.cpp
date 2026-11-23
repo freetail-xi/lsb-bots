@@ -8,7 +8,14 @@
 #include "common/logging.h"
 
 #include <array>
+#include <cctype>
+#include <chrono>
+#include <ctime>
+#include <deque>
+#include <map>
 #include <string_view>
+
+#include <fmt/format.h>
 
 namespace bots
 {
@@ -176,13 +183,20 @@ void ensureSchema()
                      "pos_rot tinyint(3) unsigned NOT NULL DEFAULT 0, "
                      "personality text NULL, "
                      "chattiness tinyint(3) unsigned NULL, "
+                     "diary text NULL, "
                      "PRIMARY KEY (name)"
                      ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci");
 
     // Added after the table first shipped.
     db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS chattiness tinyint(3) unsigned NULL AFTER personality");
     db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS subjob tinyint(2) unsigned NULL AFTER level");
+    db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS diary text NULL AFTER chattiness");
 }
+
+namespace
+{
+std::map<uint32, std::string> diaryStored; // bot_pool.diary as loaded, and as noteEvent last saved it
+} // namespace
 
 auto loadPool() -> std::vector<PoolEntry>
 {
@@ -203,15 +217,17 @@ auto loadPool() -> std::vector<PoolEntry>
 
     std::vector<PoolEntry> pool;
 
-    const auto rset = db::preparedStmt("SELECT b.name, b.charid, b.accid, s.mjob, GREATEST(s.mlvl, b.level) AS mlvl FROM bot_pool b "
+    const auto rset = db::preparedStmt("SELECT b.name, b.charid, b.accid, b.diary, s.mjob, GREATEST(s.mlvl, b.level) AS mlvl FROM bot_pool b "
                                        "JOIN chars c ON c.charid = b.charid "
                                        "JOIN char_stats s ON s.charid = b.charid "
                                        "WHERE b.enabled = 1");
     FOR_DB_MULTIPLE_RESULTS(rset)
     {
+        const auto charId = rset->get<uint32>("charid");
+        diaryStored[charId] = rset->isNull("diary") ? std::string{} : rset->get<std::string>("diary");
         pool.push_back(PoolEntry{
             .name   = rset->get<std::string>("name"),
-            .charId = rset->get<uint32>("charid"),
+            .charId = charId,
             .accId  = rset->get<uint32>("accid"),
             .job    = rset->get<uint8>("mjob"),
             .level  = rset->get<uint8>("mlvl"),
@@ -253,6 +269,165 @@ void registerPoolChar(const uint32 charId)
 auto isPoolChar(const uint32 charId) -> bool
 {
     return poolChars.contains(charId);
+}
+
+namespace
+{
+
+constexpr std::size_t kDiaryCap    = 8;
+constexpr std::size_t kPromptLines = 3;
+
+auto whenPhrase(const int64 at) -> const char*
+{
+    const auto nowT  = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    const auto thenT = static_cast<std::time_t>(at);
+    std::tm    nowTm{};
+    std::tm    thenTm{};
+    if (localtime_r(&nowT, &nowTm) == nullptr || localtime_r(&thenT, &thenTm) == nullptr || thenT >= nowT)
+    {
+        return thenT >= nowT ? "earlier today" : "earlier";
+    }
+
+    if (nowTm.tm_year == thenTm.tm_year && nowTm.tm_yday == thenTm.tm_yday)
+    {
+        return "earlier today";
+    }
+
+    // The previous calendar day, including New Year's Day looking back at December.
+    const int gap = nowTm.tm_yday - thenTm.tm_yday;
+    if ((nowTm.tm_year == thenTm.tm_year && gap == 1) ||
+        (nowTm.tm_year == thenTm.tm_year + 1 && nowTm.tm_yday == 0 && thenTm.tm_yday >= 364))
+    {
+        return "yesterday";
+    }
+
+    return "a few days ago";
+}
+
+auto parseDiary(const std::string& stored) -> std::deque<DiaryLine>
+{
+    std::deque<DiaryLine> lines;
+    std::size_t           pos = 0;
+    while (pos < stored.size())
+    {
+        auto end = stored.find('\n', pos);
+        if (end == std::string::npos)
+        {
+            end = stored.size();
+        }
+        auto line = stored.substr(pos, end - pos);
+        pos       = end + 1;
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        if (line.empty() || !std::isdigit(static_cast<unsigned char>(line.front())))
+        {
+            continue;
+        }
+
+        int64       at = 0;
+        std::size_t i  = 0;
+        while (i < line.size() && i < 18 && std::isdigit(static_cast<unsigned char>(line[i])))
+        {
+            at = at * 10 + (line[i] - '0');
+            ++i;
+        }
+        if (i >= line.size() || line[i] != ' ')
+        {
+            continue;
+        }
+        auto text = line.substr(i + 1);
+        if (text.empty())
+        {
+            continue;
+        }
+        lines.push_back(DiaryLine{ at, std::move(text) });
+    }
+
+    while (lines.size() > kDiaryCap)
+    {
+        lines.pop_front();
+    }
+    return lines;
+}
+
+auto formatDiary(const std::deque<DiaryLine>& diary) -> std::string
+{
+    std::string out;
+    for (const auto& line : diary)
+    {
+        if (!out.empty())
+        {
+            out += '\n';
+        }
+        out += fmt::format("{} {}", line.at, line.text);
+    }
+    return out;
+}
+
+} // namespace
+
+void loadDiary(Bot& bot)
+{
+    bot.diary.clear();
+    if (const auto it = diaryStored.find(bot.charId); it != diaryStored.end())
+    {
+        bot.diary = parseDiary(it->second);
+    }
+}
+
+void noteEvent(Bot& bot, std::string fact)
+{
+    for (auto& c : fact)
+    {
+        if (c == '\n' || c == '\r')
+        {
+            c = ' ';
+        }
+    }
+    if (fact.empty())
+    {
+        return;
+    }
+
+    const auto at = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    bot.diary.push_back(DiaryLine{ static_cast<int64>(at), std::move(fact) });
+    while (bot.diary.size() > kDiaryCap)
+    {
+        bot.diary.pop_front();
+    }
+
+    const auto stored        = formatDiary(bot.diary);
+    diaryStored[bot.charId]  = stored;
+    if (!db::preparedStmt("UPDATE bot_pool SET diary = ? WHERE charid = ?", stored, bot.charId))
+    {
+        ShowErrorFmt("bots: could not save {}'s diary", bot.name);
+    }
+    else
+    {
+        ShowInfoFmt("bots: {} diary: {}", bot.name, bot.diary.back().text);
+    }
+}
+
+auto recentEvents(const Bot& bot) -> std::string
+{
+    if (bot.diary.empty())
+    {
+        return {};
+    }
+
+    const auto start = bot.diary.size() > kPromptLines ? bot.diary.size() - kPromptLines : 0;
+    std::string out;
+    for (std::size_t i = start; i < bot.diary.size(); ++i)
+    {
+        if (!out.empty())
+        {
+            out += "; ";
+        }
+        out += fmt::format("{}, {}", whenPhrase(bot.diary[i].at), bot.diary[i].text);
+    }
+    return out;
 }
 
 } // namespace bots

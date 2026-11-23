@@ -245,6 +245,9 @@ class BotModule : public CPPModule
 
         const auto occupied = bots::occupiedZones(poolIds_);
 
+        // One session logout a tick: each logout saves the character, and several at once can blow the watchdog.
+        bool endedSession = false;
+
         for (auto& bot : online_)
         {
             // Logged out this tick; a logout also leaves the session pending a zone, so check this first.
@@ -272,6 +275,14 @@ class BotModule : public CPPModule
                         ShowWarningFmt("bots: {} for {} took {} ms", what, bot.name, std::chrono::duration_cast<std::chrono::milliseconds>(took).count());
                     }
                 };
+
+                if (wanted && !endedSession && bot.sessionEnds != timer::time_point{} && now >= bot.sessionEnds && canEndSession(bot, PChar))
+                {
+                    ShowInfoFmt("bots: {}'s session is over", bot.name);
+                    logout(bot);
+                    endedSession = true;
+                    continue;
+                }
 
                 if (PChar->GetMLevel() != bot.preparedLevel && !PChar->PAI->IsEngaged() && PChar->loc.zone != nullptr)
                 {
@@ -533,13 +544,32 @@ class BotModule : public CPPModule
         bot.session->accountID        = entry->accId;
         bot.session->blowfish.status  = BLOWFISH_WAITING;
 
+        bots::loadDiary(bot);
         if (!enterZone(bot))
         {
             db::preparedStmt("DELETE FROM accounts_sessions WHERE charid = ?", bot.charId);
             return;
         }
 
-        ShowInfoFmt("bots: {} logged in ({} online)", bot.name, online_.size() + 1);
+        if (auto* PChar = bot.entity(); PChar != nullptr && PChar->loc.zone != nullptr)
+        {
+            // Sessions log bots in often: a login replaces a previous login line, so the diary keeps real events.
+            if (!bot.diary.empty() && bot.diary.back().text.starts_with("logged in at "))
+            {
+                bot.diary.pop_back();
+            }
+            bots::noteEvent(bot, fmt::format("logged in at {}", bots::prettyName(PChar->loc.zone->getName())));
+        }
+
+        if (const auto minutes = sessionMinutes())
+        {
+            bot.sessionEnds = timer::now() + std::chrono::minutes(*minutes);
+            ShowInfoFmt("bots: {} logged in for {} minutes ({} online)", bot.name, *minutes, online_.size() + 1);
+        }
+        else
+        {
+            ShowInfoFmt("bots: {} logged in ({} online)", bot.name, online_.size() + 1);
+        }
         online_.push_back(std::move(bot));
     }
 
@@ -608,6 +638,9 @@ class BotModule : public CPPModule
             PEntity->addMP(PEntity->GetMaxMP());
         }
 
+        // The character was just loaded; the next think sends the seeking flag again.
+        bot.seekingApplied = false;
+
         return true;
     }
 
@@ -638,6 +671,41 @@ class BotModule : public CPPModule
         bot.session->PChar.reset();
 
         ShowInfoFmt("bots: {} logged out ({} online)", bot.name, online_.size() - 1);
+    }
+
+    // Inclusive minutes in [SESSION_MIN, SESSION_MAX]. Null when SESSION_MAX is 0 (sessions off).
+    auto sessionMinutes() const -> std::optional<uint32>
+    {
+        auto lo = settings::get<uint32>("bots.SESSION_MIN");
+        auto hi = settings::get<uint32>("bots.SESSION_MAX");
+        if (hi == 0)
+        {
+            return std::nullopt;
+        }
+        if (hi < lo)
+        {
+            const auto tmp = lo;
+            lo             = hi;
+            hi             = tmp;
+        }
+
+        const auto span = hi - lo;
+        return span == 0 ? lo : lo + xirand::GetRandomNumber<uint32>(span + 1);
+    }
+
+    // A session that has already ended may log the bot out. Same bar as rotate (no party), and not
+    // mid-fight. withPlayer keeps a real player's party from ever timing out, including while they zone.
+    auto canEndSession(const bots::Bot& bot, const CCharEntity* PChar) const -> bool
+    {
+        if (bot.withPlayer || !isFree(bot))
+        {
+            return false;
+        }
+        if (PChar->isDead() || PChar->PAI->IsEngaged() || PChar->isInEvent())
+        {
+            return false;
+        }
+        return PChar->status != xi::Status::Disappear && PChar->status != xi::Status::Shutdown;
     }
 
     static auto isFree(const bots::Bot& bot) -> bool

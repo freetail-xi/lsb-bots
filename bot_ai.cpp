@@ -138,19 +138,21 @@ void leaveOrBreakUp(Bot& bot, PacketSystem& packets, const bool breakUp)
     auto* PChar = bot.entity();
     if (breakUp && PChar->PParty->GetLeader() == PChar)
     {
+        noteEvent(bot, "broke up the party");
         auto packet                                      = makePacket<GP_CLI_COMMAND_GROUP_BREAKUP>();
         packet->as<GP_CLI_COMMAND_GROUP_BREAKUP>()->Kind = PartyKind::Party;
         send(bot, packets, *packet);
     }
     else
     {
+        noteEvent(bot, "left the party");
         auto packet                                    = makePacket<GP_CLI_COMMAND_GROUP_LEAVE>();
         packet->as<GP_CLI_COMMAND_GROUP_LEAVE>()->Kind = PartyKind::Party;
         send(bot, packets, *packet);
     }
 }
 
-// The /sea "seeking party" flag, on while the bot has no party.
+// The /sea "seeking party" flag. On while the bot has no party and a real player is in its zone.
 void setSeeking(Bot& bot, PacketSystem& packets, const bool seeking)
 {
     auto  packet      = makePacket<GP_CLI_COMMAND_CONFIG>();
@@ -1066,6 +1068,11 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         if (bot.diedAt == timer::time_point{})
         {
             bot.diedAt = tick;
+            if (!bot.deathNoted)
+            {
+                bot.deathNoted = true;
+                noteEvent(bot, fmt::format("died in {}", prettyName(PChar->loc.zone->getName())));
+            }
         }
 
         // Take a raise when one is offered; wait longer for one when someone in the party, or close by, could cast it.
@@ -1076,11 +1083,22 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         else if (tick - bot.diedAt > (partyCanRaise(PChar) || raiserNearby(PChar) ? kRaiseWait : kHomepointDelay))
         {
             bot.diedAt = {};
+            if (!bot.homeNoted)
+            {
+                bot.homeNoted = true;
+                noteEvent(bot, "homepointed");
+            }
             sendAction(bot, packets, GP_CLI_COMMAND_ACTION_ACTIONID::HomepointMenu, PChar);
         }
         return;
     }
-    bot.diedAt = {};
+    if (bot.deathNoted && !bot.homeNoted)
+    {
+        noteEvent(bot, "got raised");
+    }
+    bot.diedAt     = {};
+    bot.deathNoted = false;
+    bot.homeNoted  = false;
 
     // Bots always carry Signet: faster resting, no TP lost to it, and the crystals and conquest points it brings.
     if (!PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Signet))
@@ -1109,6 +1127,19 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     {
         if (!bot.withPlayer)
         {
+            std::string with;
+            for (auto* PMember : PChar->PParty->members)
+            {
+                if (PMember->objtype == TYPE_PC && !botIds.contains(PMember->id))
+                {
+                    with = PMember->getName();
+                    break;
+                }
+            }
+            if (!with.empty())
+            {
+                noteEvent(bot, fmt::format("joined a party with {}", with));
+            }
             greet(bot);
         }
         bot.withPlayer   = true;
@@ -1151,9 +1182,12 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         bot.invites.clear();
     }
 
-    if (bot.seeking != (PChar->PParty == nullptr))
+    // Idle in a zone with nobody real: don't advertise on /sea. Those bots won't move until someone arrives.
+    const bool wantSeek = active && PChar->PParty == nullptr;
+    if (!bot.seekingApplied || bot.seeking != wantSeek)
     {
-        setSeeking(bot, packets, PChar->PParty == nullptr);
+        setSeeking(bot, packets, wantSeek);
+        bot.seekingApplied = true;
     }
 
 

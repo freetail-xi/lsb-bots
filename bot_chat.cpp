@@ -772,6 +772,11 @@ auto describe(const Bot& bot, const bool places = false, const bool sentInvite =
     }
     health += situation;
 
+    if (const auto recent = recentEvents(bot); !recent.empty())
+    {
+        health += fmt::format("\nRecent events (true; you may mention them): {}.", recent);
+    }
+
     // Tested against the 4B model in ~/bg3mods/scratch/lsb-bots/chat-test.py: examples or abbreviation lists get
     // copied into every line, and without the "never invent" rule it makes up levels and numbers.
     static constexpr std::array<const char*, 3> nations = { "San d'Oria", "Bastok", "Windurst" };

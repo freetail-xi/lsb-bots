@@ -445,7 +445,13 @@ auto subJobScript(const Bot& bot, CCharEntity* PChar) -> std::string
 void prepare(Bot& bot, sol::state& lua)
 {
     auto* PChar = bot.entity();
-    bot.preparedLevel = PChar->GetMLevel();
+    const auto level = PChar->GetMLevel();
+    // The first prepare of a login sets the level; only a later rise is a level-up.
+    if (bot.preparedLevel > 0 && level > bot.preparedLevel)
+    {
+        noteEvent(bot, fmt::format("reached level {}", level));
+    }
+    bot.preparedLevel = level;
 
     if (const auto subJob = subJobScript(bot, PChar); !subJob.empty())
     {
