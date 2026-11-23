@@ -1426,7 +1426,8 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, co
 
         if (bot.nextChatter == timer::time_point{})
         {
-            bot.nextChatter = tick + jitter(std::max(partyMinutes, shoutMinutes));
+            // The interval for what this bot will do: a party's small talk, or a shout when it has no party.
+            bot.nextChatter = tick + jitter(PChar->PParty != nullptr ? partyMinutes : shoutMinutes);
             continue;
         }
 

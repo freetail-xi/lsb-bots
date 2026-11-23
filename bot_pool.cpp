@@ -140,6 +140,8 @@ auto createCharacter(const std::string& name) -> bool
         db::preparedStmt("DELETE FROM char_inventory WHERE charid = ?", charId) &&
         db::preparedStmt("INSERT INTO char_inventory (charid) VALUES (?)", charId) &&
         db::preparedStmt(db::selected(jobLevelQueries[job - 1]), 1u << job, level, charId) &&
+        // char_stats.mlvl stays 1 until the first login saves it, and loadPool reads it: set it now.
+        db::preparedStmt("UPDATE char_stats SET mlvl = ? WHERE charid = ?", level, charId) &&
         db::preparedStmt("UPDATE bot_pool SET charid = ?, accid = ? WHERE name = ?", charId, accId, name);
 
     if (!ok)
@@ -201,7 +203,7 @@ auto loadPool() -> std::vector<PoolEntry>
 
     std::vector<PoolEntry> pool;
 
-    const auto rset = db::preparedStmt("SELECT b.name, b.charid, b.accid, s.mjob, s.mlvl FROM bot_pool b "
+    const auto rset = db::preparedStmt("SELECT b.name, b.charid, b.accid, s.mjob, GREATEST(s.mlvl, b.level) AS mlvl FROM bot_pool b "
                                        "JOIN chars c ON c.charid = b.charid "
                                        "JOIN char_stats s ON s.charid = b.charid "
                                        "WHERE b.enabled = 1");
