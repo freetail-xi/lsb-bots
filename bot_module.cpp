@@ -279,6 +279,8 @@ class BotModule : public CPPModule
                 if (wanted && !endedSession && bot.sessionEnds != timer::time_point{} && now >= bot.sessionEnds && canEndSession(bot, PChar))
                 {
                     ShowInfoFmt("bots: {}'s session is over", bot.name);
+                    // Parked like rotate, or the next login often picks the same bot straight back (test, 2026-11-23).
+                    resting_[bot.charId] = now + std::chrono::minutes(15);
                     logout(bot);
                     endedSession = true;
                     continue;

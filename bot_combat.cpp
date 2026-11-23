@@ -363,6 +363,14 @@ auto pretty(std::string name) -> std::string
             start = false;
         }
     }
+    // Zone names drop the apostrophe: "Port_San_dOria" would read "Port San DOria".
+    for (const std::string_view from : { "DOria", "DOraguille" })
+    {
+        if (const auto at = name.find(from); at != std::string::npos)
+        {
+            name.replace(at, 1, "d'");
+        }
+    }
     return name;
 }
 
