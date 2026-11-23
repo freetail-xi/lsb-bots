@@ -1471,8 +1471,10 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, co
                 // Canned, like tell and callout: the model was inventing the zone. "Quiet down" still holds.
                 if (const auto quiet = quietUntil.find(bot.charId); quiet == quietUntil.end() || timer::now() >= quiet->second)
                 {
+                    auto line = partyShout(PChar);
+                    ShowInfoFmt("bots: {} shouts: {}", bot.name, line);
                     std::lock_guard lock(shared.mutex);
-                    shared.replies.push_back({ bot.charId, MESSAGE_SHOUT, {}, partyShout(PChar), timer::now() });
+                    shared.replies.push_back({ bot.charId, MESSAGE_SHOUT, {}, std::move(line), timer::now() });
                 }
             }
         }
