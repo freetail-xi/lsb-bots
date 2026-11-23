@@ -9,9 +9,11 @@
 #include "bots.h"
 
 #include "common/database.h"
+#include "common/settings.h"
 #include "common/utils.h"
 #include "common/xirand.h"
 
+#include "map/ai/ai_container.h"
 #include "map/entities/char_entity.h"
 #include "map/entities/mob_entity.h"
 #include "map/map_engine.h"
@@ -106,6 +108,69 @@ auto spotNear(const xi::ZoneId zone, const position_t& around, const float minRa
         }
     }
     return around;
+}
+
+// A real player (not a pool bot, and not in a Mog House) standing within leeway of pos.
+// A zone that can't be looked up counts as near, so a camp spot is not used unchecked.
+auto nearRealPlayer(const xi::ZoneId zone, const position_t& pos, const float leeway) -> bool
+{
+    auto* PZone = zoneutils::GetZone(zone);
+    if (PZone == nullptr)
+    {
+        return true;
+    }
+
+    bool near = false;
+    PZone->ForEachChar(
+        [&](CCharEntity* PChar)
+        {
+            if (!near && !isPoolChar(PChar->id) && !PChar->inMogHouse() && distance(pos, PChar->loc.p) < leeway)
+            {
+                near = true;
+            }
+        });
+    return near;
+}
+
+// Leave the mob for a real player who is fighting it or has claimed it, or who is standing within
+// PLAYER_LEEWAY and is not in this character's party. Another bot nearby does not count.
+auto leaveForPlayers(const CCharEntity* PChar, const CMobEntity* PMob) -> bool
+{
+    if (PChar == nullptr || PMob == nullptr || PChar->loc.zone == nullptr)
+    {
+        return false;
+    }
+
+    const float leeway = static_cast<float>(settings::get<uint32>("bots.PLAYER_LEEWAY"));
+    bool        leave  = false;
+    PChar->loc.zone->ForEachChar(
+        [&](CCharEntity* POther)
+        {
+            if (leave || POther == PChar || isPoolChar(POther->id) || POther->inMogHouse())
+            {
+                return;
+            }
+
+            const bool claimed  = PMob->m_OwnerID.isSet() && PMob->m_OwnerID.UniqueNo == POther->id;
+            const bool fighting = (POther->PAI->IsEngaged() && POther->GetBattleTarget() == PMob) ||
+                                  (PMob->PAI->IsEngaged() && PMob->GetBattleTarget() == POther);
+            if (claimed || fighting)
+            {
+                leave = true;
+                return;
+            }
+
+            // The bot's own party is not "someone else's pull".
+            if (PChar->PParty != nullptr && POther->PParty == PChar->PParty)
+            {
+                return;
+            }
+            if (distance(PMob->loc.p, POther->loc.p) < leeway)
+            {
+                leave = true;
+            }
+        });
+    return leave;
 }
 
 // The next login lands here; LoadChar reads the position back from the database.

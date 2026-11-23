@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -680,7 +681,7 @@ auto asksAboutPlaces(const std::string& text) -> bool
                                [&](const char* phrase) { return t.find(phrase) != std::string::npos; });
 }
 
-auto describe(const Bot& bot, const bool places = false) -> std::string
+auto describe(const Bot& bot, const bool places = false, const bool sentInvite = true) -> std::string
 {
     static constexpr std::array<const char*, 9> races = { "", "Hume", "Hume", "Elvaan", "Elvaan", "Tarutaru", "Tarutaru", "Mithra", "Galka" };
     static constexpr std::array<const char*, 23> jobs = {
@@ -783,6 +784,8 @@ auto describe(const Bot& bot, const bool places = false) -> std::string
                          ? fmt::format("{} subjob level {}", static_cast<std::size_t>(PChar->GetSJob()) < jobs.size() ? jobs[static_cast<std::size_t>(PChar->GetSJob())] : "?",
                                        PChar->GetSLevel())
                          : fmt::format("no subjob yet (they come at level {})", settings::get<uint8>("main.SUBJOB_QUEST_LEVEL"));
+    const auto inviteLine = sentInvite ? "If someone wants to party, you've already sent them an invite."
+                                        : "If someone wants to party, you have not sent an invite.";
     return fmt::format("You're {0}, playing Final Fantasy XI on a small private server: {1} {2} level {3}, {11}, from {9}.\n"
                        "Right now: {4}, {5}.{6}\n"
                        "{10}{7}\n"
@@ -792,12 +795,12 @@ auto describe(const Bot& bot, const bool places = false) -> std::string
                        "Real FFXI party chat is short and casual: lowercase, a word or two is fine, the usual abbreviations.\n"
                        "Don't repeat or echo what they said. Plain words only: no quotes, brackets, *actions*, emoji, or your name in front.\n"
                        "Stick to what's above; don't make up items, gil, numbers, plans, places or your past. Never say you're doing something\n"
-                       "unless it says so above, and never mention being an AI. If someone wants to party, you've already sent them an invite.\n"
+                       "unless it says so above, and never mention being an AI. {12}\n"
                        "Shorthand: inc = monster coming, voke = provoke, rr = raise, sn/inv = sneak/invis, ws = weapon skill, sc = skillchain,\n"
                        "RDM/WHM = main/sub job, -,- = tired or unimpressed, >> points at a target.",
                        bot.name, race, job < jobs.size() ? jobs[job] : "adventurer", PChar->GetMLevel(), zone, doing, health,
                        places ? fmt::format("\nGood places at your level: {}.", camps) : std::string(), personalityOf(bot),
-                       nation < nations.size() ? nations[nation] : "San d'Oria", nearbyMonsters(PChar), sub);
+                       nation < nations.size() ? nations[nation] : "San d'Oria", nearbyMonsters(PChar), sub, inviteLine);
 }
 
 void request(const Bot& bot, const uint8 kind, const std::string& to, const bool optional, const std::string& system, const std::string& prompt)
@@ -856,14 +859,14 @@ void request(const Bot& bot, const uint8 kind, const std::string& to, const bool
     shared.wake.notify_one();
 }
 
-void ask(const Bot& bot, const Heard& heard, const bool optional, const std::string& note = {})
+void ask(const Bot& bot, const Heard& heard, const bool optional, const std::string& note = {}, const bool sentInvite = true)
 {
     if (optional && !feelsLikeTalking(bot))
     {
         return;
     }
 
-    auto system = describe(bot, asksAboutPlaces(heard.text));
+    auto system = describe(bot, asksAboutPlaces(heard.text), sentInvite);
     if (!note.empty())
     {
         system += "\n" + note;
@@ -1184,6 +1187,22 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
 namespace
 {
 
+// Within LEVEL_WINDOW of this bot. A player who isn't online to check is not blocked.
+auto levelNear(const CCharEntity* PChar, const std::string& name) -> bool
+{
+    if (PChar == nullptr)
+    {
+        return false;
+    }
+    const auto* PPlayer = zoneutils::GetCharByName(name);
+    if (PPlayer == nullptr)
+    {
+        return true;
+    }
+    const auto window = static_cast<int>(settings::get<uint32>("bots.LEVEL_WINDOW"));
+    return std::abs(static_cast<int>(PChar->GetMLevel()) - static_cast<int>(PPlayer->GetMLevel())) <= window;
+}
+
 // The usual answer to a line nobody gave an order in.
 void respond(std::vector<Listener>& listeners)
 {
@@ -1208,8 +1227,10 @@ void respond(std::vector<Listener>& listeners)
                 }
                 continue;
             }
-            ask(*listener.bot, listener.heard, false);
-            if (wantsParty(listener.heard.text))
+            const bool party  = wantsParty(listener.heard.text);
+            const bool invite = party && levelNear(listener.bot->entity(), listener.heard.from);
+            ask(*listener.bot, listener.heard, false, party && !invite ? "You have not sent them an invite." : "", !party || invite);
+            if (invite)
             {
                 listener.bot->invites.push_back(listener.heard.from);
             }
@@ -1238,19 +1259,35 @@ void respond(std::vector<Listener>& listeners)
     }
     else if (isBroadcast(kind) && !named)
     {
+        // Someone looking for a group out loud gets one invite, from a bot without a party whose level is close.
+        // A bot further than LEVEL_WINDOW does not take that invite, and does not block one who is close enough.
+        const bool party   = wantsParty(listeners.front().heard.text);
+        auto       free    = listeners.end();
+        bool       anyFree = false;
+        if (party)
+        {
+            for (auto it = listeners.begin(); it != listeners.end(); ++it)
+            {
+                if (it->bot->entity()->PParty != nullptr)
+                {
+                    continue;
+                }
+                anyFree = true;
+                if (free == listeners.end() && levelNear(it->bot->entity(), it->heard.from))
+                {
+                    free = it;
+                }
+            }
+        }
+        const bool invite  = free != listeners.end();
+        const bool skipped = anyFree && !invite;
         for (std::size_t i = 0; i < std::min<std::size_t>(2, listeners.size()); ++i)
         {
-            ask(*listeners[i].bot, listeners[i].heard, true);
+            ask(*listeners[i].bot, listeners[i].heard, true, skipped ? "You have not sent them an invite." : "", !skipped);
         }
-
-        // Someone looking for a group out loud gets one invite, from a bot without a party.
-        if (wantsParty(listeners.front().heard.text))
+        if (invite)
         {
-            const auto free = std::ranges::find_if(listeners, [](const Listener& listener) { return listener.bot->entity()->PParty == nullptr; });
-            if (free != listeners.end())
-            {
-                free->bot->invites.push_back(free->heard.from);
-            }
+            free->bot->invites.push_back(free->heard.from);
         }
     }
 }
@@ -1300,6 +1337,29 @@ void carryOut(const std::vector<OrderPlan>& plans, const Heard& heard)
     {
         ask(*bot, heard, false, notes[bot]);
         partners[heard.from] = { bot->charId, timer::now() };
+    }
+}
+
+// Job, main level, and the zone the bot is standing in. A few era phrasings; the zone name is getName() as the
+// module shows it (underscores as spaces). There is no short-name table.
+auto partyShout(const CCharEntity* PChar) -> std::string
+{
+    static constexpr std::array<const char*, 23> jobs = {
+        "", "WAR", "MNK", "WHM", "BLM", "RDM", "THF", "PLD", "DRK", "BST", "BRD", "RNG",
+        "SAM", "NIN", "DRG", "SMN", "BLU", "COR", "PUP", "DNC", "SCH", "GEO", "RUN",
+    };
+    const auto index = static_cast<std::size_t>(PChar->GetMJob());
+    const auto abbr  = index < jobs.size() && jobs[index][0] != '\0' ? std::string(jobs[index]) : std::string("ADV");
+    const auto level = static_cast<int>(PChar->GetMLevel());
+    auto       zone  = PChar->loc.zone->getName();
+    std::ranges::replace(zone, '_', ' ');
+
+    switch (xirand::GetRandomNumber<uint32>(4))
+    {
+        case 0: return fmt::format("lfp {} {}, {}", level, lower(abbr), lower(zone));
+        case 1: return fmt::format("LFP {}{} @ {}", abbr, level, zone);
+        case 2: return fmt::format("{}{} lf pt in {}", level, lower(abbr), lower(zone));
+        default: return fmt::format("lfp {}{} {}", lower(abbr), level, lower(zone));
     }
 }
 
@@ -1407,7 +1467,12 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, co
                 });
             if (heard)
             {
-                speakUp(bot, MESSAGE_SHOUT, "You want a party. Shout for one the way players do, mentioning your job and level.");
+                // Canned, like tell and callout: the model was inventing the zone. "Quiet down" still holds.
+                if (const auto quiet = quietUntil.find(bot.charId); quiet == quietUntil.end() || timer::now() >= quiet->second)
+                {
+                    std::lock_guard lock(shared.mutex);
+                    shared.replies.push_back({ bot.charId, MESSAGE_SHOUT, {}, partyShout(PChar), timer::now() });
+                }
             }
         }
     }

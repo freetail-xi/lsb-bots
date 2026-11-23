@@ -18,6 +18,8 @@ xi.settings.bots =
     CAMP_CHANCE          = 70, -- Percent of logins that start at a camp for the bot's level instead of the pool home
     HUNT                 = true, -- Bots without a party hunt monsters near their level, in zones with real players
     BOT_PARTIES          = true, -- Unpartied bots in a zone with real players sometimes team up and hunt together
+    PLAYER_LEEWAY        = 40, -- Yalms. Bots leave a real player's mobs alone inside this, and aren't placed this close. They still fight back
+    LEVEL_WINDOW         = 10, -- Levels. Balance won't send a bot further than this from the player; invites use it, and logins prefer it
 
     -- Chat through any OpenAI-style chat completions endpoint. Personalities are in bot_pool.personality.
     -- Default is the local llama-server (systemctl --user start lsb-chat). For a hosted API, e.g. OpenAI:

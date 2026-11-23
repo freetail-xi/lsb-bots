@@ -601,6 +601,8 @@ auto partyReady(CCharEntity* PLeader) -> bool
 }
 
 // A bot on its own picks an unclaimed monster near its level and goes for it, like a player soloing.
+// A mob a real player is fighting or has claimed, or one standing within PLAYER_LEEWAY of a real player
+// outside this bot's party, is left alone. Something that attacks the bot is still fought (combatTarget).
 auto huntTarget(Bot& bot, CCharEntity* PChar, const timer::time_point tick) -> CBattleEntity*
 {
     if (tick < bot.nextHunt)
@@ -622,7 +624,8 @@ auto huntTarget(Bot& bot, CCharEntity* PChar, const timer::time_point tick) -> C
     PChar->loc.zone->ForEachMob(
         [&](CMobEntity* PMob)
         {
-            if (PMob->isDead() || !PMob->PAI->IsSpawned() || PMob->PAI->IsEngaged() || PMob->m_OwnerID.isSet() || PMob->m_Type != xi::MobType::Normal)
+            if (PMob->isDead() || !PMob->PAI->IsSpawned() || PMob->PAI->IsEngaged() || PMob->m_OwnerID.isSet() || PMob->m_Type != xi::MobType::Normal ||
+                leaveForPlayers(PChar, PMob))
             {
                 return;
             }

@@ -578,6 +578,10 @@ auto unpullable(const CCharEntity* PChar, CMobEntity* PMob, const position_t& ca
     {
         return "busy or claimed";
     }
+    if (leaveForPlayers(PChar, PMob))
+    {
+        return "beside a player";
+    }
     if (PMob->m_Type != xi::MobType::Normal)
     {
         return "special";
@@ -654,7 +658,8 @@ auto loosePullable(const CCharEntity* PChar, CMobEntity* PMob) -> bool
 {
     const auto* choice = choiceFor(PChar);
     return PMob->isAlive() && PMob->PAI->IsSpawned() && !PMob->PAI->IsEngaged() && !PMob->m_OwnerID.isSet() && PMob->m_Type == xi::MobType::Normal &&
-           PMob->PMaster == nullptr && !unwanted(PChar, PMob) && (choice == nullptr || choice->only.empty() || asked(PChar, PMob));
+           PMob->PMaster == nullptr && !unwanted(PChar, PMob) && !leaveForPlayers(PChar, PMob) &&
+           (choice == nullptr || choice->only.empty() || asked(PChar, PMob));
 }
 
 auto nearestAny(CCharEntity* PChar, const Pull& pull) -> CMobEntity*

@@ -31,6 +31,7 @@
 class CBaseEntity;
 class CBattleEntity;
 class CCharEntity;
+class CMobEntity;
 class CPathFind;
 class PacketSystem;
 enum class SpellID : uint16;
@@ -341,6 +342,8 @@ auto combatSpot(CCharEntity* PChar, CBattleEntity* PTarget, float range) -> std:
 auto findCamps(uint8 level) -> std::vector<Place>;
 auto campZoneNames(uint8 level, std::size_t count) -> std::vector<std::string>;
 auto spotNear(xi::ZoneId zone, const position_t& around, float minRadius, float maxRadius) -> position_t;
+auto nearRealPlayer(xi::ZoneId zone, const position_t& pos, float leeway) -> bool; // a real player, not a pool bot, within leeway of pos
+auto leaveForPlayers(const CCharEntity* PChar, const CMobEntity* PMob) -> bool;    // a real player's fight or claim, or within PLAYER_LEEWAY of one outside the party
 void placeAt(uint32 charId, const Place& place);
 void placeAtHome(uint32 charId);
 auto playerZones(const std::set<uint32>& botIds) -> std::map<xi::ZoneId, PlayerZone>;

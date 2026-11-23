@@ -45,7 +45,6 @@ constexpr auto kPresenceInterval = std::chrono::seconds(5);
 constexpr auto kBalanceInterval  = std::chrono::seconds(30);
 constexpr auto kGroupingInterval = std::chrono::seconds(60);
 constexpr auto kSlowStep         = std::chrono::milliseconds(200);
-constexpr int  kNearLevel        = 6; // pool levels this close to a connected player's log in first
 
 } // namespace
 
@@ -314,9 +313,11 @@ class BotModule : public CPPModule
         {
             playerLevels.insert(player.level);
         }
+        // Prefer a pool level within LEVEL_WINDOW of someone online. Same window balance and invites use.
+        const auto window = static_cast<int>(settings::get<uint32>("bots.LEVEL_WINDOW"));
         const auto nearPlayer = [&](const bots::PoolEntry& entry)
         {
-            return std::ranges::any_of(playerLevels, [&](const uint8 level) { return std::abs(static_cast<int>(entry.level) - static_cast<int>(level)) <= kNearLevel; });
+            return std::ranges::any_of(playerLevels, [&](const uint8 level) { return std::abs(static_cast<int>(entry.level) - static_cast<int>(level)) <= window; });
         };
 
         std::vector<const bots::PoolEntry*> candidates;
@@ -438,7 +439,9 @@ class BotModule : public CPPModule
             return;
         }
 
-        const auto zones = bots::playerZones(poolIds_);
+        const auto window = static_cast<int>(settings::get<uint32>("bots.LEVEL_WINDOW"));
+        const auto leeway = static_cast<float>(settings::get<uint32>("bots.PLAYER_LEEWAY"));
+        const auto zones  = bots::playerZones(poolIds_);
 
         for (const auto& [zone, players] : zones)
         {
@@ -452,8 +455,23 @@ class BotModule : public CPPModule
                 continue;
             }
 
-            const bots::Place place{ zone, bots::spotNear(zone, players.pos, 25.0f, 70.0f) };
-            const auto        gap = [&](const uint8 level)
+            // At least PLAYER_LEEWAY from the player this spot is anchored on, then reject a point that
+            // still landed on another real player (or on the anchor, when no navmesh point turned up).
+            const float minRadius = std::max<float>(25.0f, leeway);
+            const float maxRadius = std::max<float>(70.0f, minRadius + 30.0f);
+            bots::Place place{ zone, players.pos };
+            bool        clear = false;
+            for (int attempt = 0; attempt < 4 && !clear; ++attempt)
+            {
+                place.pos = bots::spotNear(zone, players.pos, minRadius, maxRadius);
+                clear     = !bots::nearRealPlayer(zone, place.pos, leeway);
+            }
+            if (!clear)
+            {
+                continue;
+            }
+
+            const auto gap = [&](const uint8 level)
             {
                 return std::abs(static_cast<int>(level) - static_cast<int>(players.level));
             };
@@ -469,7 +487,8 @@ class BotModule : public CPPModule
                     }
                 }
 
-                if (best != nullptr)
+                // Closest pool level is still too far: leave the zone under-filled rather than send them.
+                if (best != nullptr && gap(best->level) <= window)
                 {
                     bots::placeAt(best->charId, place);
                     login(*best);
@@ -488,7 +507,7 @@ class BotModule : public CPPModule
                 }
             }
 
-            if (best != nullptr)
+            if (best != nullptr && gap(best->entity()->GetMLevel()) <= window)
             {
                 ShowInfoFmt("bots: {} heads to {}", best->name, zone);
                 bots::travel(best->entity(), place.zone, place.pos);
