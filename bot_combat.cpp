@@ -51,6 +51,16 @@
 namespace bots
 {
 
+// m_Abilities is 512 bits. Blood pacts start at ABILITY_HEALING_RUBY and live in m_PetCommands, offset by that.
+auto knowsAbility(CCharEntity* PChar, const uint16 id) -> bool
+{
+    if (id >= ABILITY_HEALING_RUBY)
+    {
+        return charutils::hasPetAbility(PChar, id - ABILITY_HEALING_RUBY);
+    }
+    return charutils::hasAbility(PChar, id);
+}
+
 namespace
 {
 
@@ -206,7 +216,7 @@ auto tryAbility(Bot& bot, PacketSystem& packets, const uint16 id, CBattleEntity*
                                  (!bot.directives.avoid.empty() && std::ranges::contains(bot.directives.avoid, familyName(PAbility->getName()))));
     };
 
-    if (PAbility == nullptr || !charutils::hasAbility(PChar, id) || told() || PChar->PRecastContainer->HasRecast(xi::RecastType::Ability, PAbility->getRecastId(), 0s) ||
+    if (PAbility == nullptr || !knowsAbility(PChar, id) || told() || PChar->PRecastContainer->HasRecast(xi::RecastType::Ability, PAbility->getRecastId(), 0s) ||
         !throttle(bot, kAbilityKey | id, PTarget->id, std::chrono::seconds(5), tick))
     {
         return false;

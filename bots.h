@@ -291,6 +291,7 @@ void disengage(Bot& bot, PacketSystem& packets);
 void walkTo(CCharEntity* PChar, const position_t& pos, float within, timer::time_point tick);
 
 // bot_combat.cpp
+auto knowsAbility(CCharEntity* PChar, uint16 id) -> bool; // m_Abilities, or m_PetCommands for a blood pact
 auto throttle(Bot& bot, uint32 key, uint32 targetId, timer::duration cooldown, timer::time_point tick) -> bool;
 auto isTank(xi::Job job) -> bool; // PLD, WAR, NIN, RUN
 auto isCaster(xi::Job job) -> bool;

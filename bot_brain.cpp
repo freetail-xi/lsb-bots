@@ -892,7 +892,7 @@ auto resolve(std::string said) -> std::optional<Wanted>
 
 auto canDo(CCharEntity* PChar, const Wanted& wanted) -> bool
 {
-    return wanted.ability != 0 ? charutils::hasAbility(PChar, wanted.ability) : canCast(PChar, wanted.ladder);
+    return wanted.ability != 0 ? knowsAbility(PChar, wanted.ability) : canCast(PChar, wanted.ladder);
 }
 
 // The name to say: the tier this bot will actually use.

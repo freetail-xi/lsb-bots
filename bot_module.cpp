@@ -610,9 +610,10 @@ class BotModule : public CPPModule
         login(*entry);
     }
 
-    // Unpartied bots in a zone with real players sometimes team up: within 5 levels and 40 yalms of the
-    // leader, tank then healer then damage, 2 to 6. The tank (or the best puller, when there is no tank)
-    // sends the invites, and so leads when they are accepted. Below 15 the party may be mages only.
+    // Unpartied bots in a zone with real players (or any zone, when ACTIVE_EVERYWHERE) sometimes team up:
+    // within 5 levels and 40 yalms of the leader, tank then healer then damage, 2 to 6. The tank (or the
+    // best puller, when there is no tank) sends the invites, and so leads when they are accepted. Below
+    // 15 the party may be mages only.
     void formParties()
     {
         if (!settings::get<bool>("bots.BOT_PARTIES"))
@@ -620,13 +621,14 @@ class BotModule : public CPPModule
             return;
         }
 
-        const auto occupied = bots::occupiedZones(poolIds_);
+        const auto occupied         = bots::occupiedZones(poolIds_);
+        const bool activeEverywhere = settings::get<bool>("bots.ACTIVE_EVERYWHERE");
         std::map<xi::ZoneId, std::vector<bots::Bot*>> byZone;
         for (auto& bot : online_)
         {
             auto* PChar = bot.entity();
             if (PChar != nullptr && PChar->PParty == nullptr && PChar->loc.zone != nullptr && !PChar->isDead() && PChar->status == xi::Status::Normal &&
-                occupied.contains(PChar->getZone()) && bot.invites.empty())
+                (activeEverywhere || occupied.contains(PChar->getZone())) && bot.invites.empty())
             {
                 byZone[PChar->getZone()].push_back(&bot);
             }
