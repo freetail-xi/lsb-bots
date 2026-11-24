@@ -1388,6 +1388,11 @@ auto askBrain(const std::string& text, CCharEntity* PSpeaker, const std::vector<
     {
         return 0;
     }
+    // Test server 2026-11-24: a blank party line still cost a model call ("party brain on \"  \"").
+    if (std::ranges::all_of(text, [](const unsigned char c) { return std::isspace(c) != 0; }))
+    {
+        return 0;
+    }
 
     static std::once_flag started;
     std::call_once(started, [] { std::thread(worker).detach(); });
