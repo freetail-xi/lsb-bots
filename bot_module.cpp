@@ -1131,6 +1131,7 @@ class BotModule : public CPPModule
 
     // A session that has already ended may log the bot out. Same bar as rotate (no party), and not
     // mid-fight. withPlayer keeps a real player's party from ever timing out, including while they zone.
+    // returnUntil is the same bar: a party walking back from a wipe is not free.
     auto canEndSession(const bots::Bot& bot, const CCharEntity* PChar) const -> bool
     {
         if (bot.withPlayer || !isFree(bot))
@@ -1144,10 +1145,12 @@ class BotModule : public CPPModule
         return PChar->status != xi::Status::Disappear && PChar->status != xi::Status::Shutdown;
     }
 
+    // Not in a party. Walking back from a wipe counts as not free too: rotate, balance, and session
+    // logout all use this, and a zone tick can drop PParty.
     static auto isFree(const bots::Bot& bot) -> bool
     {
         const auto* PChar = bot.entity();
-        return PChar != nullptr && PChar->PParty == nullptr;
+        return PChar != nullptr && PChar->PParty == nullptr && bot.returnUntil == timer::time_point{};
     }
 
     auto isOnline(const uint32 charId) const -> bool

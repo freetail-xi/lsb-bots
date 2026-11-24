@@ -1165,6 +1165,19 @@ auto autoCamp(CCharEntity* PLeader, const bool withPlayer) -> bool
     return true;
 }
 
+// The party's camp, copied (zone and position). Empty when this party has no Pull, this bot is not in that
+// zone, or the zone is a city. The leader may be dead or away from the spot. Callers keep the copy; the Pull may be cleared later.
+auto campPlace(const CCharEntity* PChar) -> std::optional<Place>
+{
+    const auto* pull = pullFor(PChar);
+    if (pull == nullptr || PChar->loc.zone == nullptr || pull->zone != PChar->getZone() ||
+        (static_cast<uint16>(PChar->loc.zone->GetTypeMask()) & static_cast<uint16>(xi::ZoneType::City)) != 0)
+    {
+        return std::nullopt;
+    }
+    return Place{ pull->zone, pull->camp };
+}
+
 // Where this bot's party is camped, while the leader is still there; not in towns.
 auto campSpot(const CCharEntity* PChar) -> std::optional<position_t>
 {

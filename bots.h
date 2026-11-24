@@ -176,6 +176,8 @@ struct Bot
     bool                        deathNoted{};    // this death is already a diary line
     bool                        loginNoted{};    // this login is already a diary line
     bool                        homeNoted{};     // the homepoint for this death is already a diary line
+    std::optional<Place>        returnCamp{};    // copy of the party's camp (zone and position) to walk back to after a wipe
+    timer::time_point           returnUntil{};   // heading back until this; unset means not regrouping
     bool                        withPlayer{};    // its party has had a real player in it
     uint8                       preparedLevel{}; // level its spells and gear were set for
     position_t                  home{};          // where it logged in, for idle wandering
@@ -334,6 +336,7 @@ void stopPulling(CBattleEntity* PLeader);
 void setCamp(CBattleEntity* PLeader);
 void breakCamp(CBattleEntity* PLeader);
 auto campSpot(const CCharEntity* PChar) -> std::optional<position_t>;
+auto campPlace(const CCharEntity* PChar) -> std::optional<Place>; // copy of the Pull camp; empty when the party has none
 auto beingPulled(const CCharEntity* PChar, const CBattleEntity* PMob) -> bool;
 auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLeader, timer::time_point tick) -> bool;
 void watchPull(CCharEntity* PChar); // every tick: what the pull under way is taking out of the party

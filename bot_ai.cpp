@@ -75,6 +75,7 @@ constexpr float kThreatRange     = 40.0f; // how far away a monster attacking th
 constexpr float kHuntRange       = 30.0f; // how far a bot on its own looks for something to fight
 constexpr auto  kHomepointDelay  = std::chrono::seconds(60);
 constexpr auto  kRaiseWait       = std::chrono::minutes(3);
+constexpr auto  kReturnCap       = std::chrono::minutes(10); // a wiped bot party may walk back this long, then idle
 constexpr auto  kSettleTime      = std::chrono::seconds(2); // the leader has stopped for this long
 constexpr auto  kPlayerGoneGrace = std::chrono::seconds(20);
 constexpr uint32 kAttackKey      = 0x30000;
@@ -820,6 +821,64 @@ auto restInFight(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CBattleEnt
     return false;
 }
 
+// No real player in the party. withPlayer still covers the grace after one leaves, so that party does not walk back.
+auto partyIsBots(const Bot& bot, const CCharEntity* PChar, const std::set<uint32>& botIds) -> bool
+{
+    return PChar->PParty != nullptr && !bot.withPlayer && !hasRealPlayer(PChar->PParty, botIds);
+}
+
+auto campZoneText(const CCharEntity* PChar, const xi::ZoneId zone) -> std::string
+{
+    if (PChar->loc.zone != nullptr && PChar->getZone() == zone)
+    {
+        return prettyName(PChar->loc.zone->getName());
+    }
+    if (const auto* PZone = zoneutils::GetZone(zone))
+    {
+        return prettyName(PZone->getName());
+    }
+    return "somewhere";
+}
+
+// Copies the Pull camp while a bot-only party is dead. A raise before the homepoint drops it again.
+void rememberCamp(Bot& bot, const CCharEntity* PChar, const std::set<uint32>& botIds)
+{
+    if (bot.returnUntil != timer::time_point{} || bot.returnCamp || !partyIsBots(bot, PChar, botIds))
+    {
+        return;
+    }
+    if (const auto camp = campPlace(PChar))
+    {
+        bot.returnCamp = camp;
+    }
+}
+
+// Homepoint of a bot-only party that had a camp: walk back, for at most kReturnCap. A second homepoint does not extend it.
+void startReturn(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, const timer::time_point tick)
+{
+    if (bot.returnUntil != timer::time_point{})
+    {
+        return;
+    }
+    if (!partyIsBots(bot, PChar, botIds))
+    {
+        bot.returnCamp.reset();
+        return;
+    }
+    if (!bot.returnCamp)
+    {
+        bot.returnCamp = campPlace(PChar);
+    }
+    if (!bot.returnCamp)
+    {
+        return;
+    }
+    bot.returnUntil = tick + kReturnCap;
+    const auto where = campZoneText(PChar, bot.returnCamp->zone);
+    noteEvent(bot, fmt::format("wiped at {}, heading back", where));
+    ShowInfoFmt("bots: {} is heading back to {}", PChar->getName(), where);
+}
+
 } // namespace
 
 auto Bot::entity() const -> CCharEntity*
@@ -1075,6 +1134,9 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             }
         }
 
+        // Before anyone homepoints. A party with a real player does not take a copy.
+        rememberCamp(bot, PChar, botIds);
+
         // Take a raise when one is offered; wait longer for one when someone in the party, or close by, could cast it.
         if (PChar->m_hasRaise)
         {
@@ -1088,6 +1150,7 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
                 bot.homeNoted = true;
                 noteEvent(bot, "homepointed");
             }
+            startReturn(bot, PChar, botIds, tick);
             sendAction(bot, packets, GP_CLI_COMMAND_ACTION_ACTIONID::HomepointMenu, PChar);
         }
         return;
@@ -1095,6 +1158,10 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     if (bot.deathNoted && !bot.homeNoted)
     {
         noteEvent(bot, "got raised");
+        if (bot.returnUntil == timer::time_point{})
+        {
+            bot.returnCamp.reset();
+        }
     }
     bot.diedAt     = {};
     bot.deathNoted = false;
@@ -1200,10 +1267,46 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         setSitting(bot, packets, false);
     }
 
+    // Back in the camp zone, out of time, or a real player joined: drop the copy and behave as today.
+    if (bot.returnUntil != timer::time_point{})
+    {
+        const bool arrived = bot.returnCamp && PChar->getZone() == bot.returnCamp->zone;
+        const bool capped  = tick >= bot.returnUntil;
+        if (capped || arrived || bot.withPlayer || !bot.returnCamp)
+        {
+            if (capped && !arrived && !bot.withPlayer && bot.returnCamp)
+            {
+                ShowInfoFmt("bots: {} stopped heading back to {}", PChar->getName(), campZoneText(PChar, bot.returnCamp->zone));
+            }
+            bot.returnCamp.reset();
+            bot.returnUntil = {};
+        }
+    }
+
     // No real player around to see it: the bot stands idle, only fighting back if something attacks it.
-    if (!active && (PTarget == nullptr || PTarget->GetBattleTarget() != PChar))
+    // A party still walking back to its camp is exempt until the clear above.
+    if (!active && bot.returnUntil == timer::time_point{} && (PTarget == nullptr || PTarget->GetBattleTarget() != PChar))
     {
         PChar->PAI->PathFind->Clear();
+        return;
+    }
+
+    // The leader zones to the copied camp. Members follow, which zones to the leader once the leader is there.
+    if (bot.returnUntil != timer::time_point{} && bot.returnCamp && PChar->getZone() != bot.returnCamp->zone)
+    {
+        if (PChar->PParty != nullptr && PChar->PParty->GetLeader() == PChar)
+        {
+            travel(PChar, bot.returnCamp->zone, bot.returnCamp->pos);
+        }
+        else if (auto* PLead = leaderOf(PChar);
+                 PLead != nullptr && !PLead->isDead() && (PLead->getZone() == bot.returnCamp->zone || PLead->getZone() == PChar->getZone()))
+        {
+            follow(PChar, PLead, tick);
+        }
+        else
+        {
+            PChar->PAI->PathFind->Clear();
+        }
         return;
     }
 
