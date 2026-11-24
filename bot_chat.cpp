@@ -902,6 +902,9 @@ void speakUp(const Bot& bot, const uint8 kind, const std::string& what)
 
 void say(Bot& bot, PacketSystem& packets, const Reply& reply)
 {
+    const auto where = isTell(reply.kind) ? fmt::format("tell to {}", reply.to) : std::string(channelName(reply.kind));
+    ShowInfoFmt("bots: {} says ({}): {}", bot.name, where, reply.text);
+
     if (isTell(reply.kind))
     {
         auto  packet       = makePacket<GP_CLI_COMMAND_CHAT_NAME>();
@@ -1499,7 +1502,6 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, co
                 if (const auto quiet = quietUntil.find(bot.charId); quiet == quietUntil.end() || timer::now() >= quiet->second)
                 {
                     auto line = partyShout(PChar);
-                    ShowInfoFmt("bots: {} shouts: {}", bot.name, line);
                     std::lock_guard lock(shared.mutex);
                     shared.replies.push_back({ bot.charId, MESSAGE_SHOUT, {}, std::move(line), timer::now() });
                 }

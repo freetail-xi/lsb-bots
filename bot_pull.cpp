@@ -6,6 +6,7 @@
 //
 //   The puller picks the nearest suitable monster within reach of camp and goes once the party will be ready by the
 //   time it gets back with it (HP, MP, the fight at camp over), counting the resting, Refresh and cures in between.
+//   Suitable is the party's highest level, or its lowest member when a real player is in the party.
 //   Ready means enough to come through a bad pull, judged by what the last few pulls took out of each member; until it
 //   has seen a couple, the fixed rest lines. It goes straight out, opens on it and runs back. Whenever it holds off it
 //   says why, once. The leader's "pull anyway" skips the waits.
@@ -101,6 +102,9 @@ struct Pull
     std::map<uint32, PullCost> costs;    // by member id
     std::map<uint32, Sample>   sampling; // this pull, from leaving camp until its fight is over
     bool                       sampled{}; // its monster reached the party, so it counts
+    timer::time_point          noTargetAt{}; // last "nothing to pull" info line
+    std::string                stuckChoice;  // restriction that has found nothing in reach
+    timer::time_point          stuckSince{};
 };
 
 // By party leader.
@@ -115,11 +119,13 @@ struct Choice
 };
 std::map<uint32, Choice> choices;
 
-constexpr auto kGiveUpFor  = std::chrono::minutes(2);
-constexpr auto kRecallHold = std::chrono::seconds(20); // called back: back at camp before the next pull
+constexpr auto kGiveUpFor   = std::chrono::minutes(2);
+constexpr auto kDropChoice  = std::chrono::minutes(2); // a pull restriction with nothing in reach is dropped
+constexpr auto kNoTargetLog = std::chrono::minutes(1); // "nothing to pull" info line, per party
+constexpr auto kRecallHold  = std::chrono::seconds(20); // called back: back at camp before the next pull
 
 constexpr float kLinkRadius  = 8.0f;  // other monsters this close to a target might link
-constexpr int   kWeakestGap  = -3;    // levels below the party's highest, for the usual pick
+constexpr int   kWeakestGap  = -3;    // levels below levelOf(), for the usual pick
 constexpr int   kFallbackGap = -9;    // and when nothing else is around
 constexpr float kPullNear    = 50.0f; // how far from camp the puller looks first
 constexpr float kPullLimit   = 180.0f; // and the furthest it goes, when there's nothing closer
@@ -556,14 +562,23 @@ auto asked(const CCharEntity* PChar, const CMobEntity* PMob) -> bool
     return choice != nullptr && std::ranges::contains(choice->only, prettyName(PMob->getName()));
 }
 
+// Highest level in the party. With a real player in it, the lowest instead, so a level 1 player is not offered the bots' prey.
 auto levelOf(const CCharEntity* PChar) -> int
 {
-    int level = 0;
+    int  highest = 0;
+    int  lowest  = 255;
+    bool player  = false;
     for (const auto* PMember : PChar->PParty->members)
     {
-        level = std::max<int>(level, PMember->GetMLevel());
+        const int level = PMember->GetMLevel();
+        highest         = std::max<int>(highest, level);
+        lowest          = std::min<int>(lowest, level);
+        if (PMember->objtype == TYPE_PC && !isPoolChar(PMember->id))
+        {
+            player = true;
+        }
     }
-    return level;
+    return player ? lowest : highest;
 }
 
 // Why a monster can't be pulled, or nullptr when it can.
@@ -898,11 +913,11 @@ auto pullChoiceText(const CCharEntity* PChar) -> std::string
 
 // "pull bats only", "Siege Bats and Borer Beetles ONLY", "don't pull soldiers", "pull anything": what the party's puller goes
 // for, read from the line here because the model took "bats only" for "stop pulling". The note for the bot that answers, or
-// nothing when the line isn't about what to pull.
+// nothing when the line isn't about what to pull. A pool bot's own line is not a request, same as the other orders.
 auto pullChoice(const std::string& text, CCharEntity* PSpeaker) -> std::optional<std::string>
 {
     auto* PLeader = PSpeaker != nullptr ? leaderOfParty(PSpeaker) : nullptr;
-    if (PLeader == nullptr || PSpeaker->loc.zone == nullptr)
+    if (PLeader == nullptr || PSpeaker->loc.zone == nullptr || isPoolChar(PSpeaker->id))
     {
         return std::nullopt;
     }
@@ -1248,10 +1263,106 @@ void watchPull(CCharEntity* PChar)
     }
 }
 
+namespace
+{
+
+// Why pickTarget found nothing, as one of the info-line reasons. "beside a player" is counted with claimed.
+auto noTargetReason(CCharEntity* PChar, const position_t& camp) -> std::string
+{
+    if (PChar->loc.zone == nullptr)
+    {
+        return "no mob in range";
+    }
+
+    const int   level  = levelOf(PChar);
+    const int   tough  = toughestGap(PChar);
+    const auto* choice = choiceFor(PChar);
+    const bool  named  = choice != nullptr && !choice->only.empty();
+
+    int inRange = 0;
+    int weak    = 0;
+    int strong  = 0;
+    int claimed = 0;
+    int ready   = 0;
+    PChar->loc.zone->ForEachMob(
+        [&](CMobEntity* PMob)
+        {
+            if (PMob->m_Type != xi::MobType::Normal || PMob->PMaster != nullptr || distance(camp, PMob->loc.p) > kPullLimit || !PMob->isAlive() ||
+                !PMob->PAI->IsSpawned())
+            {
+                return;
+            }
+            ++inRange;
+            if (unwanted(PChar, PMob))
+            {
+                return;
+            }
+            const int gap = PMob->GetMLevel() - level;
+            if (gap < kFallbackGap && !asked(PChar, PMob))
+            {
+                ++weak;
+            }
+            else if (gap > tough && !asked(PChar, PMob))
+            {
+                ++strong;
+            }
+            else if (PMob->PAI->IsEngaged() || PMob->m_OwnerID.isSet() || leaveForPlayers(PChar, PMob))
+            {
+                ++claimed;
+            }
+            else
+            {
+                ++ready;
+            }
+        });
+
+    if (inRange == 0)
+    {
+        return "no mob in range";
+    }
+    if (named && weak + strong + claimed + ready == 0)
+    {
+        return fmt::format("restricted to {}", listed(choice->only));
+    }
+    if (ready == 0 && claimed > 0 && weak == 0 && strong == 0)
+    {
+        return "claimed";
+    }
+    if (ready == 0 && weak > 0 && weak >= strong && claimed == 0)
+    {
+        return "all too weak";
+    }
+    if (ready == 0 && strong > 0 && claimed == 0)
+    {
+        return "all too strong";
+    }
+    if (claimed > 0 && claimed >= weak && claimed >= strong)
+    {
+        return "claimed";
+    }
+    if (weak > strong)
+    {
+        return "all too weak";
+    }
+    if (strong > 0)
+    {
+        return "all too strong";
+    }
+    if (named)
+    {
+        return fmt::format("restricted to {}", listed(choice->only));
+    }
+    return "no mob in range";
+}
+
+} // namespace
+
 auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLeader, const timer::time_point tick) -> bool
 {
     auto* pull = pullFor(PChar);
-    if (pull == nullptr || pull->pullerId != PChar->id || PLeader == nullptr || PLeader->getZone() != PChar->getZone())
+    // leaderOf() is null when this bot leads. A leader who is the puller still has a camp to pull to.
+    CBattleEntity* PCamp = PLeader != nullptr ? PLeader : leaderOfParty(PChar);
+    if (pull == nullptr || pull->pullerId != PChar->id || PCamp == nullptr || PCamp->getZone() != PChar->getZone())
     {
         return false;
     }
@@ -1269,7 +1380,8 @@ auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLea
     // The leader away from camp (or a town): no new pulls, and one on its way out is dropped. One already coming back still comes.
     const auto camp = pull->camp;
     const bool town = (static_cast<uint16>(PChar->loc.zone->GetTypeMask()) & static_cast<uint16>(xi::ZoneType::City)) != 0;
-    if (town || pull->zone != PChar->getZone() || distance(PLeader->loc.p, camp) > kCampDrift)
+    // A leader who pulls leaves camp on every pull, so only another leader's drift holds pulls.
+    if (town || pull->zone != PChar->getZone() || (PCamp != PChar && distance(PCamp->loc.p, camp) > kCampDrift))
     {
         if (pull->stage == Stage::Outbound)
         {
@@ -1279,7 +1391,7 @@ auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLea
         {
             if (!town && pull->zone == PChar->getZone())
             {
-                waitSay("away", fmt::format("Holding pulls while {} is away from camp.", PLeader->getName()));
+                waitSay("away", fmt::format("Holding pulls while {} is away from camp.", PCamp->getName()));
             }
             return false;
         }
@@ -1302,6 +1414,48 @@ auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLea
             {
                 PMob = nearestAny(PChar, *pull);
             }
+
+            // A restriction that nothing in reach satisfies is dropped after two minutes, then the usual picks run.
+            const auto choiceText = pullChoiceText(PChar);
+            if (PMob == nullptr && !choiceText.empty())
+            {
+                if (pull->stuckChoice != choiceText)
+                {
+                    pull->stuckChoice = choiceText;
+                    pull->stuckSince  = tick;
+                }
+                else if (tick - pull->stuckSince >= kDropChoice)
+                {
+                    const auto* PNamed = leaderOfParty(PChar);
+                    if (PNamed != nullptr)
+                    {
+                        choices.erase(PNamed->id);
+                    }
+                    ShowInfoFmt("bots: {}'s party drops its pull restriction ({}) after 2 minutes with nothing in reach",
+                                PNamed != nullptr ? PNamed->getName() : PChar->getName(), choiceText);
+                    callout(bot, "Nothing in reach for that, so I'll pull whatever's here.", false);
+                    pull->stuckChoice.clear();
+                    pull->stuckSince = {};
+                    PMob             = pickTarget(PChar, *pull, tick);
+                    if (PMob == nullptr && pull->force)
+                    {
+                        PMob = nearestAny(PChar, *pull);
+                    }
+                }
+            }
+            else
+            {
+                pull->stuckChoice.clear();
+                pull->stuckSince = {};
+            }
+
+            if (PMob == nullptr && tick - pull->noTargetAt >= kNoTargetLog)
+            {
+                pull->noTargetAt   = tick;
+                const auto* PNamed = leaderOfParty(PChar);
+                ShowInfoFmt("bots: {}'s party has nothing to pull: {}", PNamed != nullptr ? PNamed->getName() : PChar->getName(), noTargetReason(PChar, camp));
+            }
+
             if (!pull->force)
             {
                 const float trip = PMob != nullptr ? tripSeconds(PChar, *pull, PMob) * pull->pace : 0.0f;
