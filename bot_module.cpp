@@ -522,7 +522,8 @@ class BotModule : public CPPModule
                 }
                 timed("restock", [&] { bots::restock(bot, lua, now); });
                 timed("linkshell", [&] { bots::linkshellUpkeep(bot, lua, now); });
-                const bool active = bot.withPlayer || occupied.contains(PChar->getZone());
+                // ACTIVE_EVERYWHERE (test): every bot plays as if a real player were in its zone, to measure what that costs.
+                const bool active = bot.withPlayer || occupied.contains(PChar->getZone()) || settings::get<bool>("bots.ACTIVE_EVERYWHERE");
                 timed("think", [&] { bots::think(bot, *packets_, poolIds_, active, now); });
                 if (bot.entity() != nullptr)
                 {
