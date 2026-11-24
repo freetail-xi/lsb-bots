@@ -2,9 +2,11 @@
 // Bot chat through a local LLM (llama.cpp's llama-server, OpenAI-style API).
 //
 //   Tells always get an answer. Party and linkshell lines get one from a bot that's
-//   named, or else one bot picked at random. Say, shout and yell are answered by any
-//   bot that's named; otherwise a couple of the bots that heard it may join in, and
-//   the model decides from the bot's personality whether to.
+//   named, or else one bot picked at random. Say, shout and yell from a real player
+//   are answered by any bot that's named; otherwise a couple of the bots that heard
+//   it may join in, and the model decides from the bot's personality whether to.
+//   A player's shout is answered by tell, unless this bot is shouting back about a
+//   party invite. A say, shout, or yell from another bot is not answered.
 //
 //   Requests run on a worker thread; replies are sent from the main thread after a
 //   typing delay, through the same chat packets a client sends.
@@ -65,6 +67,7 @@ struct Request
     bool        optional{};
     std::string body; // JSON for /v1/chat/completions
     std::string name; // the bot's, to strip it if the model signs its line
+    uint32      stamp{}; // 0 for lines that aren't an answer; a newer answer cancels an older one
 };
 
 struct Reply
@@ -75,6 +78,8 @@ struct Reply
     std::string       text;
     timer::time_point sendAt{};
     bool              callout{}; // a macro-style announcement, not conversation
+    bool              canned{};  // partyShout: its own timer, not the model shout cap
+    uint32            stamp{};
 };
 
 struct Shared
@@ -83,6 +88,7 @@ struct Shared
     std::condition_variable wake;
     std::deque<Request>     requests;
     std::vector<Reply>      replies;
+    std::map<uint32, timer::time_point> dropped; // answer stamps superseded while the worker still has them
 };
 
 // Never destroyed: the worker waits on it for the life of the process, and destroying a condition
@@ -101,6 +107,22 @@ std::set<uint32>                                             inviteRefused; // t
 constexpr auto kConversationWindow = std::chrono::seconds(90);
 constexpr int  kMaxBotRun          = 3;
 constexpr auto kQuietTime          = std::chrono::minutes(20);
+constexpr auto kSameSpeaker        = std::chrono::seconds(5); // a second line from the same person replaces the first
+
+// Main thread only. One handleChat call is one tick. The newest answer for a bot replaces an older one from
+// that tick, or from the same speaker inside kSameSpeaker, while it is still queued or unsent.
+struct Asked
+{
+    timer::time_point tick{};
+    timer::time_point at{};
+    std::string       speaker;
+    uint32            stamp{};
+};
+
+std::map<uint32, Asked>             asked;
+uint32                              askStamp = 1;
+timer::time_point                   chatTick{};
+std::map<uint32, timer::time_point> lastModelShout; // when say() last sent a model shout, per bot
 
 // Main thread only: party chat by party, players and bots alike, so the brain reads a line in context.
 std::map<uint32, std::deque<std::string>> partyLines;
@@ -173,6 +195,11 @@ auto isBroadcast(const uint8 kind) -> bool
         default:
             return false;
     }
+}
+
+auto isShout(const uint8 kind) -> bool
+{
+    return kind == MESSAGE_SHOUT || kind == MESSAGE_NS_SHOUT;
 }
 
 auto channelName(const uint8 kind) -> const char*
@@ -488,6 +515,10 @@ void worker()
             shared.wake.wait(lock, [] { return !shared.requests.empty(); });
             request = std::move(shared.requests.front());
             shared.requests.pop_front();
+            if (request.stamp != 0 && shared.dropped.erase(request.stamp) > 0)
+            {
+                continue;
+            }
         }
 
         try
@@ -519,7 +550,11 @@ void worker()
             const auto delay = std::chrono::milliseconds(std::min(4000, 400 + 35 * static_cast<int>(text.size())));
 
             std::lock_guard lock(shared.mutex);
-            shared.replies.push_back(Reply{ request.charId, request.kind, std::move(request.to), std::move(text), timer::now() + delay });
+            if (request.stamp != 0 && shared.dropped.erase(request.stamp) > 0)
+            {
+                continue;
+            }
+            shared.replies.push_back(Reply{ request.charId, request.kind, std::move(request.to), std::move(text), timer::now() + delay, false, false, request.stamp });
         }
         catch (const std::exception& err)
         {
@@ -814,7 +849,8 @@ auto describe(const Bot& bot, const bool places = false, const bool sentInvite =
                        nation < nations.size() ? nations[nation] : "San d'Oria", nearbyMonsters(PChar), sub, inviteLine);
 }
 
-void request(const Bot& bot, const uint8 kind, const std::string& to, const bool optional, const std::string& system, const std::string& prompt)
+auto request(const Bot& bot, const uint8 kind, const std::string& to, const bool optional, const std::string& system, const std::string& prompt,
+             const uint32 stamp = 0, const uint32 cancelStamp = 0) -> bool
 {
     // The bot's own lines go back as its turns, everyone else's as the other side; the newest is the one being answered.
     // Lines in a row from one side are one turn, and the last turn is always the other side's: chat templates refuse
@@ -862,12 +898,26 @@ void request(const Bot& bot, const uint8 kind, const std::string& to, const bool
                                   48 + std::max(0, settings::get<int32>("bots.LLM_THINK_TOKENS")));
 
     std::lock_guard lock(shared.mutex);
-    if (optional && shared.requests.size() >= kMaxPending)
+    const bool replacing = cancelStamp != 0 && std::ranges::any_of(shared.requests, [&](const Request& pending) { return pending.stamp == cancelStamp; });
+    if (optional && shared.requests.size() >= kMaxPending && !replacing)
     {
-        return;
+        return false;
     }
-    shared.requests.push_back(Request{ bot.charId, kind, to, optional, body, bot.name });
+    if (cancelStamp != 0)
+    {
+        const auto now     = timer::now();
+        const auto queued  = std::erase_if(shared.requests, [&](const Request& pending) { return pending.stamp == cancelStamp; });
+        const auto waiting = std::erase_if(shared.replies, [&](const Reply& pending) { return pending.stamp == cancelStamp; });
+        std::erase_if(shared.dropped, [&](const auto& entry) { return now - entry.second > std::chrono::minutes(2); });
+        if (queued == 0 && waiting == 0)
+        {
+            // Already popped by the worker. Drop the reply when that request finishes.
+            shared.dropped.emplace(cancelStamp, now);
+        }
+    }
+    shared.requests.push_back(Request{ bot.charId, kind, to, optional, body, bot.name, stamp });
     shared.wake.notify_one();
+    return true;
 }
 
 void ask(const Bot& bot, const Heard& heard, const bool optional, const std::string& note = {}, const bool sentInvite = true)
@@ -886,7 +936,22 @@ void ask(const Bot& bot, const Heard& heard, const bool optional, const std::str
     {
         system += "\nThat wasn't said to you; chime in only if you'd naturally say something, otherwise reply PASS.";
     }
-    request(bot, heard.kind, heard.from, optional, system, {});
+
+    // Two answers for one bot in this tick, or a second line from the same speaker a few seconds later: keep the newest.
+    const auto now         = timer::now();
+    auto&      prior       = asked[bot.charId];
+    const bool sameTick    = prior.stamp != 0 && chatTick != timer::time_point{} && prior.tick == chatTick;
+    const bool sameSpeaker = prior.stamp != 0 && !heard.from.empty() && prior.speaker == heard.from && now - prior.at < kSameSpeaker;
+    const auto cancel      = sameTick || sameSpeaker ? prior.stamp : 0;
+    const auto stamp       = askStamp++;
+    if (askStamp == 0)
+    {
+        askStamp = 1;
+    }
+    if (request(bot, heard.kind, heard.from, optional, system, {}, stamp, cancel))
+    {
+        prior = Asked{ chatTick, now, heard.from, stamp };
+    }
 }
 
 // A line the bot starts itself, in the given channel.
@@ -900,8 +965,24 @@ void speakUp(const Bot& bot, const uint8 kind, const std::string& what)
     request(bot, kind, {}, true, fmt::format("{}\nNobody is talking right now. {}", describe(bot), what), {});
 }
 
-void say(Bot& bot, PacketSystem& packets, const Reply& reply)
+auto say(Bot& bot, PacketSystem& packets, const Reply& reply) -> bool
 {
+    // partyShout keeps nextChatter. This only limits lines the model wrote.
+    if (isShout(reply.kind) && !reply.canned)
+    {
+        const auto minutes = settings::get<uint32>("bots.CHAT_SHOUT_MINUTES");
+        if (minutes > 0)
+        {
+            const auto now = timer::now();
+            if (const auto last = lastModelShout.find(bot.charId); last != lastModelShout.end() && now - last->second < std::chrono::minutes(minutes))
+            {
+                ShowDebugFmt("bots: {} drops a shout, one model shout per {} minutes: {}", bot.name, minutes, reply.text);
+                return false;
+            }
+            lastModelShout[bot.charId] = now;
+        }
+    }
+
     const auto where = isTell(reply.kind) ? fmt::format("tell to {}", reply.to) : std::string(channelName(reply.kind));
     ShowInfoFmt("bots: {} says ({}): {}", bot.name, where, reply.text);
 
@@ -926,7 +1007,7 @@ void say(Bot& bot, PacketSystem& packets, const Reply& reply)
             const auto now = timer::now();
             std::erase_if(recentCallouts, [&](const auto& entry) { return now - entry.second >= kCalloutMemory; });
             recentCallouts[fmt::format("{}|{}", bot.name, reply.text)] = now;
-            return;
+            return true;
         }
         if (isParty(reply.kind))
         {
@@ -935,6 +1016,7 @@ void say(Bot& bot, PacketSystem& packets, const Reply& reply)
     }
 
     remember(bot.charId, fmt::format("{}{}", kOwnPrefix, reply.text));
+    return true;
 }
 
 struct Listener
@@ -1018,6 +1100,8 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
         return;
     }
 
+    chatTick = timer::now();
+
     std::map<std::string, std::vector<Listener>> byMessage;
 
     // Lines the brain has decided on: carry out the orders, or answer them like any other line.
@@ -1078,8 +1162,15 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
                 continue;
             }
 
+            // The same shout can sit on the packet list twice. One copy is enough.
+            auto& bucket = byMessage[fmt::format("{}|{}|{}", heard.kind, heard.from, heard.text)];
+            if (std::ranges::any_of(bucket, [&](const Listener& listener) { return listener.bot->charId == bot.charId; }))
+            {
+                continue;
+            }
+
             remember(bot.charId, fmt::format("[{}] {}: {}", channelName(heard.kind), heard.from, heard.text));
-            byMessage[fmt::format("{}|{}|{}", heard.kind, heard.from, heard.text)].push_back(Listener{ &bot, heard });
+            bucket.push_back(Listener{ &bot, heard });
         }
         bot.heard.clear();
     }
@@ -1094,6 +1185,13 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
         if (isParty(kind) && !botNames.contains(from))
         {
             notePartyLine(PSender, listeners.front().heard.text);
+        }
+
+        // A say, shout, or yell from a pool bot is not a conversation. Name or character id,
+        // so a chat name that misses the pool name set still counts. Party and linkshell between bots are unchanged.
+        if (isBroadcast(kind) && (botNames.contains(from) || (PSender != nullptr && isPoolChar(PSender->id))))
+        {
+            continue;
         }
 
         // Bots answer each other too, but only now and then, one at a time, and a run of bot-only lines ends
@@ -1239,11 +1337,37 @@ void respond(std::vector<Listener>& listeners)
 {
     const auto kind = listeners.front().heard.kind;
 
+    // Named or not: a broadcast from a pool bot gets no model line. handleChat skips these too;
+    // this covers a line that arrived through the brain.
+    if (isBroadcast(kind))
+    {
+        if (const auto* PSender = zoneutils::GetCharByName(listeners.front().heard.from); PSender != nullptr && isPoolChar(PSender->id))
+        {
+            return;
+        }
+    }
+
+    // A player's shout is a tell, unless this answer is the party-invite shout.
+    const auto answer = [&](const Listener& listener, const bool optional, const std::string& note, const bool sentInvite, const bool shoutBack)
+    {
+        auto heard = listener.heard;
+        if (isShout(heard.kind) && !shoutBack)
+        {
+            heard.kind = MESSAGE_TELL;
+        }
+        ask(*listener.bot, heard, optional, note, sentInvite);
+    };
+
     bool named = false;
+    std::set<uint32> answered;
     for (const auto& listener : listeners)
     {
         if (isTell(kind) || mentions(listener.heard.text, listener.bot->name))
         {
+            if (!answered.insert(listener.bot->charId).second)
+            {
+                continue;
+            }
             named = true;
             if (isTell(kind) && wantsPearl(listener.heard.text))
             {
@@ -1260,7 +1384,7 @@ void respond(std::vector<Listener>& listeners)
             }
             const bool party  = wantsParty(listener.heard.text) && !saysNoInvites(listener.heard.text);
             const bool invite = party && levelNear(listener.bot->entity(), listener.heard.from);
-            ask(*listener.bot, listener.heard, false, party && !invite ? "You have not sent them an invite." : "", !party || invite);
+            answer(listener, false, party && !invite ? "You have not sent them an invite." : "", !party || invite, party);
             if (invite)
             {
                 listener.bot->invites.push_back(listener.heard.from);
@@ -1283,7 +1407,7 @@ void respond(std::vector<Listener>& listeners)
     {
         const bool question = listeners.front().heard.text.find('?') != std::string::npos;
         ask(*listeners.front().bot, listeners.front().heard, !question);
-        if (listeners.size() > 1)
+        if (listeners.size() > 1 && listeners[1].bot->charId != listeners.front().bot->charId)
         {
             ask(*listeners[1].bot, listeners[1].heard, true);
         }
@@ -1312,9 +1436,14 @@ void respond(std::vector<Listener>& listeners)
         }
         const bool invite  = free != listeners.end();
         const bool skipped = anyFree && !invite;
-        for (std::size_t i = 0; i < std::min<std::size_t>(2, listeners.size()); ++i)
+        // One reply per bot. A party shout stays a shout; any other shout goes out as a tell.
+        for (std::size_t i = 0; i < listeners.size() && answered.size() < 2; ++i)
         {
-            ask(*listeners[i].bot, listeners[i].heard, true, skipped ? "You have not sent them an invite." : "", !skipped);
+            if (!answered.insert(listeners[i].bot->charId).second)
+            {
+                continue;
+            }
+            answer(listeners[i], true, skipped ? "You have not sent them an invite." : "", !skipped, party);
         }
         if (invite)
         {
@@ -1503,7 +1632,7 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, co
                 {
                     auto line = partyShout(PChar);
                     std::lock_guard lock(shared.mutex);
-                    shared.replies.push_back({ bot.charId, MESSAGE_SHOUT, {}, std::move(line), timer::now() });
+                    shared.replies.push_back({ bot.charId, MESSAGE_SHOUT, {}, std::move(line), timer::now(), false, true });
                 }
             }
         }
@@ -1535,8 +1664,7 @@ void deliverChat(std::vector<Bot>& online, PacketSystem& packets)
         const auto bot = std::ranges::find(online, reply.charId, &Bot::charId);
         if (bot != online.end() && bot->entity() != nullptr && bot->entity()->loc.zone != nullptr)
         {
-            say(*bot, packets, reply);
-            if (!reply.to.empty())
+            if (say(*bot, packets, reply) && !reply.to.empty())
             {
                 partners[reply.to] = { reply.charId, timer::now() };
             }
