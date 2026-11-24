@@ -128,7 +128,7 @@ constexpr float kLinkRadius  = 8.0f;  // other monsters this close to a target m
 constexpr int   kWeakestGap  = -3;    // levels below levelOf(), for the usual pick
 constexpr int   kFallbackGap = -9;    // and when nothing else is around
 constexpr float kPullNear    = 50.0f; // how far from camp the puller looks first
-constexpr float kPullLimit   = 180.0f; // and the furthest it goes, when there's nothing closer
+constexpr float kPullLimit   = 100.0f; // and the furthest it goes, when there's nothing closer
 constexpr float kCampReached = 3.0f;
 constexpr auto  kSpareTime   = std::chrono::seconds(30); // on top of the running time, for a trip's time limit
 constexpr float kCampDrift   = 20.0f; // the leader this far from camp pauses pulling
@@ -628,8 +628,29 @@ auto pullable(const CCharEntity* PChar, CMobEntity* PMob, const position_t& camp
     return unpullable(PChar, PMob, camp, level, weakest, toughestGap(PChar)) == nullptr;
 }
 
-// The nearest suitable monster to camp: within 50 yalms if there is one, else within 180; near the party's level (weaker
-// only when there's nothing in the usual range); one standing alone over one that might link. Not one it just gave up on.
+// Another party's puller is already on this monster: its Pull still holds that target (outbound or bringing it back).
+auto takenByPuller(const CCharEntity* PChar, const CMobEntity* PMob) -> bool
+{
+    const auto* PLeader = leaderOfParty(PChar);
+    const auto  skip    = PLeader != nullptr ? PLeader->id : 0;
+    const auto  id      = EntityId(PMob);
+    for (const auto& [leaderId, other] : pulls)
+    {
+        if (leaderId == skip || other.stage == Stage::Waiting || other.zone != PMob->getZone())
+        {
+            continue;
+        }
+        if (other.mob == id)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The nearest suitable monster to camp: within 50 yalms if there is one, else within 100; near the party's level (weaker
+// only when there's nothing in the usual range); one standing alone over one that might link. Not one it just gave up on,
+// and not one another party's puller is already going for.
 auto pickTarget(CCharEntity* PChar, const Pull& pull, const timer::time_point tick) -> CMobEntity*
 {
     const auto& camp  = pull.camp;
@@ -643,7 +664,7 @@ auto pickTarget(CCharEntity* PChar, const Pull& pull, const timer::time_point ti
             [&](CMobEntity* PMob)
             {
                 if (!pullable(PChar, PMob, camp, level, weakest) || distance(camp, PMob->loc.p) > radius ||
-                    (tick < pull.gaveUpUntil && EntityId(PMob) == pull.gaveUpOn))
+                    (tick < pull.gaveUpUntil && EntityId(PMob) == pull.gaveUpOn) || takenByPuller(PChar, PMob))
                 {
                     return;
                 }
@@ -892,6 +913,11 @@ auto pullerOf(const CCharEntity* PChar) -> uint32
     return pull != nullptr ? pull->pullerId : 0;
 }
 
+auto hasPull(const CCharEntity* PChar) -> bool
+{
+    return pullFor(PChar) != nullptr;
+}
+
 auto pullChoiceText(const CCharEntity* PChar) -> std::string
 {
     const auto* choice = choiceFor(PChar);
@@ -1060,7 +1086,7 @@ auto pullAnyway(const std::string& text, CCharEntity* PSpeaker) -> std::optional
     return "The leader just told you to pull anyway, so you're going now, ready or not.";
 }
 
-// Why nothing can be pulled, as a clause a player can read ("of the 37 Eschan Wasp here, 30 more than 180 yalms from camp"); empty
+// Why nothing can be pulled, as a clause a player can read ("of the 37 Eschan Wasp here, 30 more than 100 yalms from camp"); empty
 // when something can.
 auto pullBlocker(CCharEntity* PPuller) -> std::string
 {
@@ -1144,7 +1170,7 @@ auto pullReport(CCharEntity* PPuller) -> std::string
                            : "You're the party's puller, at camp. " + outlook;
 }
 
-// A party of three or more bots on their own camps where its leader stands, with its best puller pulling.
+// A party of two or more bots on their own camps where its leader stands, with its best puller pulling.
 // The caller asks once the party is together and fit; true while the party is camped.
 auto autoCamp(CCharEntity* PLeader, const bool withPlayer) -> bool
 {
@@ -1156,7 +1182,7 @@ auto autoCamp(CCharEntity* PLeader, const bool withPlayer) -> bool
     const auto type    = static_cast<uint16>(PLeader->loc.zone->GetTypeMask());
     const bool hunting = (type & (static_cast<uint16>(xi::ZoneType::Outdoors) | static_cast<uint16>(xi::ZoneType::Dungeon))) != 0 &&
                          (type & static_cast<uint16>(xi::ZoneType::City)) == 0;
-    if (withPlayer || !hunting || PLeader->PParty == nullptr || PLeader->PParty->members.size() < 3)
+    if (withPlayer || !hunting || PLeader->PParty == nullptr || PLeader->PParty->members.size() < 2)
     {
         return false;
     }

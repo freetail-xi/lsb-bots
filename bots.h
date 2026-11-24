@@ -178,6 +178,8 @@ struct Bot
     bool                        homeNoted{};     // the homepoint for this death is already a diary line
     std::optional<Place>        returnCamp{};    // copy of the party's camp (zone and position) to walk back to after a wipe
     timer::time_point           returnUntil{};   // heading back until this; unset means not regrouping
+    bool                        headingOut{};    // this trip ends near the camp spot, not merely in its zone
+    timer::time_point           nextHeadOut{};   // don't look for a camp to leave town again before this
     bool                        withPlayer{};    // its party has had a real player in it
     uint8                       preparedLevel{}; // level its spells and gear were set for
     position_t                  home{};          // where it logged in, for idle wandering
@@ -349,6 +351,7 @@ auto pullAnyway(const std::string& text, CCharEntity* PSpeaker) -> std::optional
 auto pullOutlook(CCharEntity* PPuller) -> std::string; // why there's nothing to pull, or ""
 auto pullReport(CCharEntity* PPuller) -> std::string;  // what the puller is doing, for its answer
 auto pullerOf(const CCharEntity* PChar) -> uint32;             // 0 when nobody pulls
+auto hasPull(const CCharEntity* PChar) -> bool;                // the party has a Pull, whether or not anyone is pulling
 auto autoCamp(CCharEntity* PLeader, bool withPlayer) -> bool;
 auto canAct(CCharEntity* PChar) -> bool;
 auto act(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, bool travelling, timer::time_point tick) -> bool;

@@ -77,19 +77,32 @@ constexpr float kHuntRange       = 30.0f; // how far a bot on its own looks for 
 constexpr auto  kHomepointDelay  = std::chrono::seconds(60);
 constexpr auto  kRaiseWait       = std::chrono::minutes(3);
 constexpr auto  kReturnCap       = std::chrono::minutes(10); // a wiped bot party may walk back this long, then idle
+constexpr float kHeadOutNear     = 30.0f; // a trip out of town ends this close to the camp, not merely in its zone
+constexpr auto  kHeadOutWait     = std::chrono::minutes(5); // one look for a camp to leave town, per leader
 constexpr auto  kSettleTime      = std::chrono::seconds(2); // the leader has stopped for this long
 constexpr auto  kPlayerGoneGrace = std::chrono::seconds(20);
 constexpr uint32 kAttackKey      = 0x30000;
 constexpr uint32 kOutOfMPKey     = 0xB0000; // the mid-fight rest log, once a fight
 
+void setSitting(Bot& bot, PacketSystem& packets, const bool sitting);
+
 void sendAction(Bot& bot, PacketSystem& packets, const GP_CLI_COMMAND_ACTION_ACTIONID actionId, const CBaseEntity* PTarget, const uint32 param = 0)
 {
-    // The server refuses these while /healing. Resting decides when to stand (rest(), a monster on the bot); until then they wait.
+    // The server refuses these while /healing, and while the sit animation is up ("Character in invalid animation state").
+    // Resting decides when to stand (rest(), a monster on the bot); until then the action waits. A /sit stands up here,
+    // and that packet clears the animation before the action is sent.
     using enum GP_CLI_COMMAND_ACTION_ACTIONID;
     const bool blockedResting = actionId == Attack || actionId == CastMagic || actionId == JobAbility || actionId == Shoot || actionId == Weaponskill;
-    if (blockedResting && bot.entity() != nullptr && bot.entity()->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing))
+    if (blockedResting && bot.entity() != nullptr)
     {
-        return;
+        if (bot.entity()->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing))
+        {
+            return;
+        }
+        if (bot.sitting)
+        {
+            setSitting(bot, packets, false);
+        }
     }
 
     auto  packet     = makePacket<GP_CLI_COMMAND_ACTION>();
@@ -880,6 +893,99 @@ void startReturn(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, c
     ShowInfoFmt("bots: {} is heading back to {}", PChar->getName(), where);
 }
 
+// A camp a bot-only party in town is walking to. Members copy it so the return path takes them along.
+struct Outing
+{
+    Place             place{};
+    timer::time_point until{};
+};
+
+std::map<uint32, Outing> outings;
+
+auto highestLevel(const CCharEntity* PChar) -> int
+{
+    int highest = 1;
+    for (const auto* PMember : PChar->PParty->members)
+    {
+        highest = std::max(highest, static_cast<int>(PMember->GetMLevel()));
+    }
+    return highest;
+}
+
+// Same zones autoCamp refuses: not an outdoor field or a dungeon, or a city.
+auto notHunting(const CCharEntity* PChar) -> bool
+{
+    if (PChar->loc.zone == nullptr)
+    {
+        return false;
+    }
+    const auto type    = static_cast<uint16>(PChar->loc.zone->GetTypeMask());
+    const bool hunting = (type & (static_cast<uint16>(xi::ZoneType::Outdoors) | static_cast<uint16>(xi::ZoneType::Dungeon))) != 0 &&
+                         (type & static_cast<uint16>(xi::ZoneType::City)) == 0;
+    return !hunting;
+}
+
+void endHeadOut(Bot& bot, CCharEntity* PChar)
+{
+    if (!bot.headingOut)
+    {
+        return;
+    }
+    const auto* PLead = PChar->PParty != nullptr ? PChar->PParty->GetLeader() : nullptr;
+    if (PLead != nullptr && PLead != PChar)
+    {
+        if (const auto it = outings.find(PLead->id); it != outings.end())
+        {
+            bot.nextHeadOut = it->second.until;
+        }
+    }
+    outings.erase(PChar->id);
+    bot.headingOut = false;
+}
+
+// A member of a party already walking out copies the leader's camp onto the return path.
+void joinOuting(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, const timer::time_point tick)
+{
+    if (bot.returnUntil != timer::time_point{} || bot.nextHeadOut > tick || !partyIsBots(bot, PChar, botIds) || PChar->PParty->GetLeader() == PChar)
+    {
+        return;
+    }
+    const auto it = outings.find(PChar->PParty->GetLeader()->id);
+    if (it == outings.end() || tick >= it->second.until)
+    {
+        return;
+    }
+    bot.returnCamp  = it->second.place;
+    bot.returnUntil = it->second.until;
+    bot.headingOut  = true;
+}
+
+// Leader of a bot-only party standing where autoCamp will not hunt: pick a camp and walk there. At most once per 5 minutes.
+void startHeadOut(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, const timer::time_point tick)
+{
+    if (PChar->PParty == nullptr || PChar->PParty->GetLeader() != PChar || bot.returnUntil != timer::time_point{} || tick < bot.nextHeadOut ||
+        !partyIsBots(bot, PChar, botIds) || !notHunting(PChar) || hasPull(PChar))
+    {
+        return;
+    }
+
+    const int  level = highestLevel(PChar);
+    bot.nextHeadOut  = tick + kHeadOutWait;
+    const auto camps = findCamps(static_cast<uint8>(level));
+    if (camps.empty())
+    {
+        ShowInfoFmt("bots: {}'s party has no camp to head to (level {})", PChar->getName(), level);
+        return;
+    }
+
+    const auto& camp   = camps[xirand::GetRandomNumber<std::size_t>(camps.size())];
+    bot.returnCamp     = camp;
+    bot.returnUntil    = tick + kReturnCap;
+    bot.headingOut     = true;
+    outings[PChar->id] = Outing{ camp, bot.returnUntil };
+    ShowInfoFmt("bots: {}'s party heads out to {} (level {})", PChar->getName(), campZoneText(PChar, camp.zone), level);
+}
+
 } // namespace
 
 auto Bot::entity() const -> CCharEntity*
@@ -1296,20 +1402,46 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     }
 
     // Back in the camp zone, out of time, or a real player joined: drop the copy and behave as today.
+    // A trip out of town waits until the leader is near the camp spot, or autoCamp would camp at the zone line.
     if (bot.returnUntil != timer::time_point{})
     {
-        const bool arrived = bot.returnCamp && PChar->getZone() == bot.returnCamp->zone;
+        const bool inZone  = bot.returnCamp && PChar->getZone() == bot.returnCamp->zone;
+        bool       arrived = inZone;
+        if (bot.headingOut && inZone)
+        {
+            const bool atSpot = distance(PChar->loc.p, bot.returnCamp->pos) <= kHeadOutNear;
+            if (PChar->PParty != nullptr && PChar->PParty->GetLeader() == PChar)
+            {
+                arrived = atSpot;
+            }
+            else if (const auto* PLead = PChar->PParty != nullptr ? PChar->PParty->GetLeader() : nullptr; PLead != nullptr && outings.find(PLead->id) != outings.end())
+            {
+                // The leader is still on the way. Stay with the return path so a quiet zone does not idle the member at the line.
+                arrived = atSpot;
+            }
+            else
+            {
+                auto*      PFollow  = leaderOf(PChar);
+                const bool withLead = PFollow != nullptr && PFollow->getZone() == PChar->getZone() &&
+                                      distance(PChar->loc.p, PFollow->loc.p) <= kFollowDistance + 3.0f;
+                arrived = atSpot || withLead;
+            }
+        }
         const bool capped  = tick >= bot.returnUntil;
         if (capped || arrived || bot.withPlayer || !bot.returnCamp)
         {
             if (capped && !arrived && !bot.withPlayer && bot.returnCamp)
             {
-                ShowInfoFmt("bots: {} stopped heading back to {}", PChar->getName(), campZoneText(PChar, bot.returnCamp->zone));
+                ShowInfoFmt("bots: {} stopped heading {} to {}", PChar->getName(), bot.headingOut ? "out" : "back", campZoneText(PChar, bot.returnCamp->zone));
             }
+            endHeadOut(bot, PChar);
             bot.returnCamp.reset();
             bot.returnUntil = {};
         }
     }
+
+    joinOuting(bot, PChar, botIds, tick);
+    startHeadOut(bot, PChar, botIds, tick);
 
     // No real player around to see it: the bot stands idle, only fighting back if something attacks it.
     // A party still walking back to its camp is exempt until the clear above.
@@ -1325,6 +1457,26 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         if (PChar->PParty != nullptr && PChar->PParty->GetLeader() == PChar)
         {
             travel(PChar, bot.returnCamp->zone, bot.returnCamp->pos);
+        }
+        else if (auto* PLead = leaderOf(PChar);
+                 PLead != nullptr && !PLead->isDead() && (PLead->getZone() == bot.returnCamp->zone || PLead->getZone() == PChar->getZone()))
+        {
+            follow(PChar, PLead, tick);
+        }
+        else
+        {
+            PChar->PAI->PathFind->Clear();
+        }
+        return;
+    }
+
+    // In the camp's zone, but not at the spot yet. A wipe return stops at the zone line, above.
+    if (bot.headingOut && bot.returnUntil != timer::time_point{} && bot.returnCamp && PChar->getZone() == bot.returnCamp->zone &&
+        distance(PChar->loc.p, bot.returnCamp->pos) > kHeadOutNear)
+    {
+        if (PChar->PParty != nullptr && PChar->PParty->GetLeader() == PChar)
+        {
+            walkTo(PChar, bot.returnCamp->pos, kHeadOutNear, tick);
         }
         else if (auto* PLead = leaderOf(PChar);
                  PLead != nullptr && !PLead->isDead() && (PLead->getZone() == bot.returnCamp->zone || PLead->getZone() == PChar->getZone()))
