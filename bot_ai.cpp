@@ -50,6 +50,7 @@
 #include <cstddef>
 #include <optional>
 #include <utility>
+#include <vector>
 
 namespace bots
 {
@@ -1086,10 +1087,37 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
 
             if (PCaster != nullptr)
             {
-                ShowDebugFmt("bots: emote from {}: target {} index {}, caster index {}, emote {}, mode {}, param {}", PCaster->getName(), target,
-                            packet->ref<uint16>(payload + offsetof(Data, TarActIndex)), packet->ref<uint16>(payload + offsetof(Data, CasActIndex)),
-                            static_cast<uint16>(theirs), static_cast<uint8>(packet->ref<uint8>(payload + offsetof(Data, Mode))),
-                            packet->ref<uint16>(payload + offsetof(Data, Param)));
+                // The same emote is queued for every bot in range, and think() runs once per bot. Log the first copy this tick.
+                const auto tarIndex = packet->ref<uint16>(payload + offsetof(Data, TarActIndex));
+                const auto casIndex = packet->ref<uint16>(payload + offsetof(Data, CasActIndex));
+                const auto mode     = static_cast<uint8>(packet->ref<uint8>(payload + offsetof(Data, Mode)));
+                const auto param    = packet->ref<uint16>(payload + offsetof(Data, Param));
+                const auto number   = static_cast<uint16>(theirs);
+                struct Seen
+                {
+                    uint32 caster{};
+                    uint32 target{};
+                    uint16 tarIndex{};
+                    uint16 casIndex{};
+                    uint16 number{};
+                    uint8  mode{};
+                    uint16 param{};
+                    bool   operator==(const Seen&) const = default;
+                };
+                static timer::time_point seenTick{};
+                static std::vector<Seen> seen;
+                if (seenTick != tick)
+                {
+                    seen.clear();
+                    seenTick = tick;
+                }
+                const Seen key{ caster, target, tarIndex, casIndex, number, mode, param };
+                if (!std::ranges::contains(seen, key))
+                {
+                    seen.push_back(key);
+                    ShowDebugFmt("bots: emote from {}: target {} index {}, caster index {}, emote {}, mode {}, param {}", PCaster->getName(), target,
+                                tarIndex, casIndex, number, mode, param);
+                }
             }
 
             const bool atMe   = target == PChar->id;

@@ -1072,8 +1072,11 @@ auto plansFor(const std::vector<ToolCall>& calls, const std::string& text, CChar
         else if (call.name == "break_camp")
         {
             // The model took "you're standing still in the camp!" for this; the camp goes only when the line says to leave it.
+            // "this way", "change camp" and "zone line" do. A map grid, a bare question, or a place name alone does not.
             if (!saysPhrase(lowered(text), { "break", "breaking", "leave", "leaving", "move", "moving", "pack up", "packing up", "let's go", "lets go", "follow me",
-                                             "new camp", "relocate", "head out", "heading out", "move on", "moving on", "done here", "camp elsewhere" }))
+                                             "new camp", "relocate", "head out", "heading out", "move on", "moving on", "done here", "camp elsewhere",
+                                             "change camp", "move camp", "switch camp", "this way", "over here", "over there", "come on", "come here",
+                                             "let's move", "lets move", "go somewhere else", "somewhere else", "find a better spot", "better spot", "zone line" }))
             {
                 ShowInfoFmt("bots: the party brain wanted camp broken on \"{}\", which doesn't say to", text);
                 continue;
@@ -1355,6 +1358,14 @@ auto plansFor(const std::vector<ToolCall>& calls, const std::string& text, CChar
         }
         else if (call.name == "set_tank" && !bots.empty())
         {
+            // "You're the leader", "X leads", "X is leader" are not who tanks. A tank word in the same line still is.
+            // This module has no packet that hands the party lead to a named member, so this plan is only dropped.
+            const auto said = lowered(text);
+            if (saysPhrase(said, { "leader", "lead", "leads", "leading" }) && !saysPhrase(said, { "tank", "tanks", "tanking", "tanker", "mt" }))
+            {
+                ShowInfoFmt("bots: the party brain wanted a tank set on \"{}\", which is about the leader", text);
+                continue;
+            }
             CBattleEntity* PTank = PSpeaker;
             for (auto* PMember : withTrusts(PSpeaker))
             {
