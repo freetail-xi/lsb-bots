@@ -1,0 +1,7 @@
+settings/bots.lua
+.vscode/
+*.session.sql
+*.bak*
+*.log
+*.out.txt
+build/
