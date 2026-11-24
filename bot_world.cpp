@@ -46,6 +46,84 @@ auto isField(const CZone* PZone) -> bool
     return (type & kFieldZones) != 0 && (type & static_cast<uint16>(xi::ZoneType::Instanced)) == 0;
 }
 
+// Nation 0 San d'Oria, 1 Bastok, 2 Windurst. Same values as chars.nation and profile.nation.
+// West Ronfaure, East Ronfaure, North Gustaberg, South Gustaberg, West Sarutabaruta, East Sarutabaruta.
+constexpr std::array<std::array<xi::ZoneId, 2>, 3> kStartingAreas{ {
+    { static_cast<xi::ZoneId>(100), static_cast<xi::ZoneId>(101) },
+    { static_cast<xi::ZoneId>(106), static_cast<xi::ZoneId>(107) },
+    { static_cast<xi::ZoneId>(115), static_cast<xi::ZoneId>(116) },
+} };
+
+auto zonesFor(const uint8 nation) -> std::vector<xi::ZoneId>
+{
+    std::vector<xi::ZoneId> zones;
+    if (nation < kStartingAreas.size())
+    {
+        zones.push_back(kStartingAreas[nation][0]);
+        zones.push_back(kStartingAreas[nation][1]);
+        return zones;
+    }
+
+    for (const auto& pair : kStartingAreas)
+    {
+        zones.push_back(pair[0]);
+        zones.push_back(pair[1]);
+    }
+    return zones;
+}
+
+auto inZones(const xi::ZoneId zone, const std::vector<xi::ZoneId>& zones) -> bool
+{
+    return std::ranges::find(zones, zone) != zones.end();
+}
+
+// findCamps first. Failing that, a Normal spawn that is not entirely above the bot (min level <= bot + 1).
+auto spotsFor(const uint8 level, const std::vector<xi::ZoneId>& zones) -> std::vector<Place>
+{
+    std::vector<Place> spots;
+    for (const auto& camp : findCamps(level))
+    {
+        if (inZones(camp.zone, zones))
+        {
+            spots.push_back(camp);
+        }
+    }
+    if (!spots.empty())
+    {
+        return spots;
+    }
+
+    for (auto& [zoneId, PZone] : g_PZoneList)
+    {
+        const auto zone = static_cast<xi::ZoneId>(zoneId);
+        if (PZone == nullptr || !inZones(zone, zones))
+        {
+            continue;
+        }
+
+        PZone->ForEachMob(
+            [&](CMobEntity* PMob)
+            {
+                if (PMob->m_Type == xi::MobType::Normal && PMob->m_minLevel <= level + 1)
+                {
+                    spots.push_back(Place{ zone, PMob->m_SpawnPoint });
+                }
+            });
+    }
+    return spots;
+}
+
+auto chooseSpot(const std::vector<Place>& spots) -> std::optional<Place>
+{
+    if (spots.empty())
+    {
+        return std::nullopt;
+    }
+
+    const auto& camp = spots[xirand::GetRandomNumber<std::size_t>(spots.size())];
+    return Place{ camp.zone, spotNear(camp.zone, camp.pos, 5.0f, 25.0f) };
+}
+
 } // namespace
 
 auto findCamps(const uint8 level) -> std::vector<Place>
@@ -100,6 +178,54 @@ auto campZoneNames(const uint8 level, const std::size_t count) -> std::vector<st
         }
     }
     return names;
+}
+
+auto inStartingArea(const xi::ZoneId zone) -> bool
+{
+    for (const auto& pair : kStartingAreas)
+    {
+        if (zone == pair[0] || zone == pair[1])
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Nation under 3 is chars.nation / profile.nation. Anything else: the other zone of the pair `here` belongs to.
+auto otherStartingZone(const uint8 nation, const xi::ZoneId here) -> std::optional<xi::ZoneId>
+{
+    if (nation < kStartingAreas.size())
+    {
+        if (here == kStartingAreas[nation][0])
+        {
+            return kStartingAreas[nation][1];
+        }
+        if (here == kStartingAreas[nation][1])
+        {
+            return kStartingAreas[nation][0];
+        }
+        return std::nullopt;
+    }
+
+    for (const auto& pair : kStartingAreas)
+    {
+        if (here == pair[0])
+        {
+            return pair[1];
+        }
+        if (here == pair[1])
+        {
+            return pair[0];
+        }
+    }
+    return std::nullopt;
+}
+
+// Where a bot below SOLO_BELOW logs in. Nation under 3 keeps to that nation's two zones; otherwise any of the six.
+auto soloPlace(const uint8 level, const uint8 nation) -> std::optional<Place>
+{
+    return chooseSpot(spotsFor(level, zonesFor(nation)));
 }
 
 // A point on the navmesh between minRadius and maxRadius from around, or around itself if none turns up.

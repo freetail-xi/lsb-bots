@@ -253,6 +253,29 @@ auto jobAbbr(const xi::Job job) -> std::string
     return bots::lowerCase(abbr);
 }
 
+// chars.nation, readable before the character is loaded. 0 San d'Oria, 1 Bastok, 2 Windurst. 255: not known.
+auto charNation(const uint32 charId) -> uint8
+{
+    if (const auto rset = db::preparedStmt("SELECT nation FROM chars WHERE charid = ?", charId); rset && rset->next() && !rset->isNull("nation"))
+    {
+        const auto nation = rset->get<uint8>("nation");
+        if (nation < 3)
+        {
+            return nation;
+        }
+    }
+    return 255;
+}
+
+auto zoneText(const xi::ZoneId zone) -> std::string
+{
+    if (auto* PZone = zoneutils::GetZone(zone))
+    {
+        return bots::prettyName(PZone->getName());
+    }
+    return fmt::format("{}", static_cast<uint16>(zone));
+}
+
 } // namespace
 
 class BotModule : public CPPModule
@@ -475,6 +498,10 @@ class BotModule : public CPPModule
         }
 
         const auto occupied = bots::occupiedZones(poolIds_);
+        // Once per tick, not once per bot. SOLO_BELOW 0 leaves the active line as it was.
+        const auto soloBelow        = settings::get<uint32>("bots.SOLO_BELOW");
+        const bool soloActive       = settings::get<bool>("bots.SOLO_ACTIVE");
+        const bool activeEverywhere = settings::get<bool>("bots.ACTIVE_EVERYWHERE");
 
         // One session logout a tick: each logout saves the character, and several at once can blow the watchdog.
         bool endedSession = false;
@@ -536,7 +563,10 @@ class BotModule : public CPPModule
                 timed("restock", [&] { bots::restock(bot, lua, now); });
                 timed("linkshell", [&] { bots::linkshellUpkeep(bot, lua, now); });
                 // ACTIVE_EVERYWHERE (test): every bot plays as if a real player were in its zone, to measure what that costs.
-                const bool active = bot.withPlayer || occupied.contains(PChar->getZone()) || settings::get<bool>("bots.ACTIVE_EVERYWHERE");
+                // SOLO_ACTIVE: a bot below SOLO_BELOW, alone in a starting area, hunts with nobody else in the zone.
+                const bool soloHere = soloActive && soloBelow > 0 && !bot.citizen && !bot.withPlayer && PChar->PParty == nullptr &&
+                                      static_cast<uint32>(PChar->GetMLevel()) < soloBelow && bots::inStartingArea(PChar->getZone());
+                const bool active = bot.withPlayer || occupied.contains(PChar->getZone()) || activeEverywhere || soloHere;
                 timed("think", [&] { bots::think(bot, *packets_, poolIds_, active, now); });
                 if (bot.entity() != nullptr)
                 {
@@ -628,16 +658,33 @@ class BotModule : public CPPModule
 
         const auto* entry = candidates[xirand::GetRandomNumber<std::size_t>(candidates.size())];
 
-        // Most go out to a camp for their level; the rest start at their pool home.
-        const auto camps = bots::findCamps(entry->level);
-        if (!camps.empty() && xirand::GetRandomNumber<uint32>(100) < settings::get<uint32>("bots.CAMP_CHANCE"))
+        // Below SOLO_BELOW: a starting area, not a town and not a camp somewhere else. 0 keeps the camp / home roll.
+        const auto soloBelow = settings::get<uint32>("bots.SOLO_BELOW");
+        if (soloBelow > 0 && entry->level < soloBelow)
         {
-            const auto& camp = camps[xirand::GetRandomNumber<std::size_t>(camps.size())];
-            bots::placeAt(entry->charId, { camp.zone, bots::spotNear(camp.zone, camp.pos, 5.0f, 25.0f) });
+            if (const auto place = bots::soloPlace(entry->level, charNation(entry->charId)))
+            {
+                bots::placeAt(entry->charId, *place);
+                ShowInfoFmt("bots: {} solos in {} (level {})", entry->name, zoneText(place->zone), static_cast<int>(entry->level));
+            }
+            else
+            {
+                ShowWarningFmt("bots: no starting area for {} (level {}); left where they were", entry->name, static_cast<int>(entry->level));
+            }
         }
         else
         {
-            bots::placeAtHome(entry->charId);
+            // Most go out to a camp for their level; the rest start at their pool home.
+            const auto camps = bots::findCamps(entry->level);
+            if (!camps.empty() && xirand::GetRandomNumber<uint32>(100) < settings::get<uint32>("bots.CAMP_CHANCE"))
+            {
+                const auto& camp = camps[xirand::GetRandomNumber<std::size_t>(camps.size())];
+                bots::placeAt(entry->charId, { camp.zone, bots::spotNear(camp.zone, camp.pos, 5.0f, 25.0f) });
+            }
+            else
+            {
+                bots::placeAtHome(entry->charId);
+            }
         }
 
         login(*entry);
@@ -646,7 +693,7 @@ class BotModule : public CPPModule
     // Unpartied bots in a zone with real players (or any zone, when ACTIVE_EVERYWHERE) sometimes team up:
     // within 5 levels and 40 yalms of the leader, tank then healer then damage, 2 to 6. The tank (or the
     // best puller, when there is no tank) sends the invites, and so leads when they are accepted. Below
-    // 15 the party may be mages only.
+    // 15 the party may be mages only. Bots below SOLO_BELOW are left out; a real player can still invite them.
     void formParties()
     {
         if (!settings::get<bool>("bots.BOT_PARTIES"))
@@ -656,11 +703,13 @@ class BotModule : public CPPModule
 
         const auto occupied         = bots::occupiedZones(poolIds_);
         const bool activeEverywhere = settings::get<bool>("bots.ACTIVE_EVERYWHERE");
+        const auto soloBelow        = settings::get<uint32>("bots.SOLO_BELOW");
         std::map<xi::ZoneId, std::vector<bots::Bot*>> byZone;
         for (auto& bot : online_)
         {
             auto* PChar = bot.entity();
             if (PChar != nullptr && !bot.citizen && PChar->PParty == nullptr && PChar->loc.zone != nullptr && !PChar->isDead() && PChar->status == xi::Status::Normal &&
+                (soloBelow == 0 || static_cast<uint32>(PChar->GetMLevel()) >= soloBelow) &&
                 (activeEverywhere || occupied.contains(PChar->getZone())) && bot.invites.empty())
             {
                 byZone[PChar->getZone()].push_back(&bot);
@@ -922,6 +971,9 @@ class BotModule : public CPPModule
         const auto leeway   = static_cast<float>(settings::get<uint32>("bots.PLAYER_LEEWAY"));
         const auto zones    = bots::playerZones(poolIds_);
         const auto citizens = bots::citizenIds(pool_);
+        const auto soloBelow = settings::get<uint32>("bots.SOLO_BELOW");
+        // A bot under SOLO_BELOW is out leveling. Don't log it into a player's zone or haul it out of a starting area.
+        const auto leveling = [&](const auto level) { return soloBelow > 0 && static_cast<uint32>(level) < soloBelow; };
         const bool citizenWaiting = std::ranges::any_of(pool_, [&](const auto& entry) { return citizens.contains(entry.charId) && available(entry); });
 
         for (const auto& [zone, players] : zones)
@@ -929,7 +981,8 @@ class BotModule : public CPPModule
             const auto here = std::ranges::count_if(online_,
                                                     [&](const auto& bot)
                                                     {
-                                                        return bot.entity() != nullptr && !bot.citizen && !bot.withPlayer && bot.entity()->getZone() == zone;
+                                                        auto* PChar = bot.entity();
+                                                        return PChar != nullptr && !bot.citizen && !bot.withPlayer && PChar->getZone() == zone && !leveling(PChar->GetMLevel());
                                                     });
             if (static_cast<uint32>(here) >= wantedPerZone)
             {
@@ -962,7 +1015,7 @@ class BotModule : public CPPModule
                 const bots::PoolEntry* best = nullptr;
                 for (const auto& entry : pool_)
                 {
-                    if (available(entry) && !citizens.contains(entry.charId) && (best == nullptr || gap(entry.level) < gap(best->level)))
+                    if (available(entry) && !citizens.contains(entry.charId) && !leveling(entry.level) && (best == nullptr || gap(entry.level) < gap(best->level)))
                     {
                         best = &entry;
                     }
@@ -981,7 +1034,7 @@ class BotModule : public CPPModule
             for (auto& bot : online_)
             {
                 auto* PChar = bot.entity();
-                if (isFree(bot) && !bot.citizen && PChar->loc.zone != nullptr && PChar->status == xi::Status::Normal && !zones.contains(PChar->getZone()) &&
+                if (isFree(bot) && !bot.citizen && !leveling(PChar->GetMLevel()) && PChar->loc.zone != nullptr && PChar->status == xi::Status::Normal && !zones.contains(PChar->getZone()) &&
                     (best == nullptr || gap(PChar->GetMLevel()) < gap(best->entity()->GetMLevel())))
                 {
                     best = &bot;

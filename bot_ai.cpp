@@ -74,6 +74,9 @@ constexpr uint8 kFightResumeMPP  = 50;    // and a BLM gets back up to nuke at t
 constexpr float kWanderRadius    = 6.0f;
 constexpr float kThreatRange     = 40.0f; // how far away a monster attacking the party gets noticed
 constexpr float kHuntRange       = 30.0f; // how far a bot on its own looks for something to fight
+constexpr auto  kPreyDry         = std::chrono::seconds(60); // solo under SOLO_BELOW: nothing to hunt for this long, then move
+constexpr auto  kPreyMove        = std::chrono::minutes(2);  // and not more often than this
+constexpr float kPreyNear        = 5.0f;                     // close enough to the new spot to start hunting again
 constexpr auto  kHomepointDelay  = std::chrono::seconds(60);
 constexpr auto  kRaiseWait       = std::chrono::minutes(3);
 constexpr auto  kReturnCap       = std::chrono::minutes(10); // a wiped bot party may walk back this long, then idle
@@ -964,6 +967,131 @@ void startHeadOut(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, 
     ShowInfoFmt("bots: {}'s party heads out to {} (level {})", PChar->getName(), campZoneText(PChar, camp.zone), level);
 }
 
+auto campsIn(const std::vector<Place>& camps, const xi::ZoneId zone) -> std::vector<Place>
+{
+    std::vector<Place> spots;
+    for (const auto& camp : camps)
+    {
+        if (camp.zone == zone)
+        {
+            spots.push_back(camp);
+        }
+    }
+    return spots;
+}
+
+// Another camp, preferably past hunt range so the walk is worth it. Same ring login uses.
+auto pickPreySpot(const std::vector<Place>& spots, const position_t& from, const bool elsewhere) -> std::optional<Place>
+{
+    if (spots.empty())
+    {
+        return std::nullopt;
+    }
+
+    std::vector<Place> far;
+    if (!elsewhere)
+    {
+        for (const auto& spot : spots)
+        {
+            if (distance(spot.pos, from) > kHuntRange)
+            {
+                far.push_back(spot);
+            }
+        }
+    }
+
+    const auto& pool = far.empty() ? spots : far;
+    const auto& camp = pool[xirand::GetRandomNumber<std::size_t>(pool.size())];
+    return Place{ camp.zone, spotNear(camp.zone, camp.pos, 5.0f, 25.0f) };
+}
+
+// Solo under SOLO_BELOW, in a starting area, with nothing in hunt range: walk to another camp in the zone.
+// No camp that fits means the zone is outgrown: travel to the nation's other starting zone. At most one new
+// spot per 2 minutes. A bot in a real player's party never reaches this.
+auto seekPrey(Bot& bot, CCharEntity* PChar, const timer::time_point tick) -> bool
+{
+    const auto soloBelow = settings::get<uint32>("bots.SOLO_BELOW");
+    if (bot.citizen || bot.withPlayer || PChar->PParty != nullptr || soloBelow == 0 || static_cast<uint32>(PChar->GetMLevel()) >= soloBelow ||
+        !inStartingArea(PChar->getZone()))
+    {
+        bot.preySpot.reset();
+        bot.preyDrySince = {};
+        return false;
+    }
+
+    if (PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing) || PChar->PAI->IsEngaged())
+    {
+        return false;
+    }
+
+    if (bot.preySpot && tick < bot.nextPreyMove)
+    {
+        if (PChar->getZone() != bot.preySpot->zone)
+        {
+            travel(PChar, bot.preySpot->zone, bot.preySpot->pos);
+            bot.preySpot.reset();
+            return true;
+        }
+        if (distance(PChar->loc.p, bot.preySpot->pos) > kPreyNear)
+        {
+            walkTo(PChar, bot.preySpot->pos, kPreyNear, tick);
+            return true;
+        }
+        bot.preySpot.reset();
+        bot.preyDrySince = tick;
+        bot.home         = PChar->loc.p;
+        return false;
+    }
+
+    if (bot.preyDrySince == timer::time_point{})
+    {
+        bot.preyDrySince = tick;
+        return false;
+    }
+    if (tick - bot.preyDrySince < kPreyDry || tick < bot.nextPreyMove)
+    {
+        return false;
+    }
+
+    const auto level     = static_cast<uint8>(PChar->GetMLevel());
+    const auto camps     = findCamps(level);
+    auto       spots     = campsIn(camps, PChar->getZone());
+    bool       elsewhere = false;
+    if (spots.empty())
+    {
+        const auto nation = static_cast<uint8>(static_cast<std::size_t>(PChar->profile.nation));
+        if (const auto other = otherStartingZone(nation, PChar->getZone()))
+        {
+            spots     = campsIn(camps, *other);
+            elsewhere = true;
+        }
+    }
+
+    const auto picked = pickPreySpot(spots, PChar->loc.p, elsewhere);
+    if (!picked)
+    {
+        // Nowhere that fits. Look again later, not every tick (findCamps walks every zone).
+        bot.nextPreyMove = tick + kPreyMove;
+        return false;
+    }
+
+    bot.nextPreyMove = tick + kPreyMove;
+    bot.preyDrySince = tick;
+    ShowInfoFmt("bots: {} moves on to find prey (level {})", bot.name, static_cast<int>(level));
+
+    if (picked->zone != PChar->getZone())
+    {
+        travel(PChar, picked->zone, picked->pos);
+        bot.preyDrySince = {};
+        return true;
+    }
+
+    bot.preySpot = picked;
+    bot.home     = picked->pos;
+    walkTo(PChar, picked->pos, kPreyNear, tick);
+    return true;
+}
+
 } // namespace
 
 void emote(Bot& bot, PacketSystem& packets, const xi::Emote emote, const CBaseEntity* PTarget)
@@ -1365,6 +1493,13 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         }
     }
 
+    // A real player's party is not the solo grind. Drop a half-finished walk so leaving later starts clean.
+    if (bot.withPlayer || PChar->PParty != nullptr)
+    {
+        bot.preySpot.reset();
+        bot.preyDrySince = {};
+    }
+
     if (bot.citizen)
     {
         bot.invites.clear();
@@ -1704,10 +1839,19 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             return;
         }
 
-        if (auto* PPrey = settings::get<bool>("bots.HUNT") ? huntTarget(bot, PChar, tick) : nullptr)
+        if (settings::get<bool>("bots.HUNT"))
         {
-            bot.focusTarget = PPrey->id;
-            return;
+            if (auto* PPrey = huntTarget(bot, PChar, tick))
+            {
+                bot.focusTarget  = PPrey->id;
+                bot.preyDrySince = {};
+                return;
+            }
+            // Nothing within 30 yalms: after a minute, walk to another camp. A player's party never gets here.
+            if (seekPrey(bot, PChar, tick))
+            {
+                return;
+            }
         }
         wander(bot, packets, PChar, tick);
     }

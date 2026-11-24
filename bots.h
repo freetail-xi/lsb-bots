@@ -210,6 +210,9 @@ struct Bot
     timer::time_point           playerGoneAt{};  // when its party last had no real player in it
     timer::time_point           nextChatter{};   // when it may next start a conversation
     timer::time_point           nextHunt{};      // when a bot on its own next looks for something to fight
+    timer::time_point           preyDrySince{};  // solo under SOLO_BELOW: nothing in hunt range since this; unset starts the clock
+    timer::time_point           nextPreyMove{};  // solo under SOLO_BELOW: earliest time it may head to another spot
+    std::optional<Place>        preySpot{};      // that spot, until it arrives
     bool                        sitting{};       // /sit in town
     uint16                      ammoId{};        // ammunition its gear plan picked, restocked when it runs out
     uint8                       emoteBack{};     // an emote to answer a player's with, once emoteAt comes
@@ -382,6 +385,9 @@ auto combatSpot(CCharEntity* PChar, CBattleEntity* PTarget, float range) -> std:
 // bot_world.cpp
 auto findCamps(uint8 level) -> std::vector<Place>;
 auto campZoneNames(uint8 level, std::size_t count) -> std::vector<std::string>;
+auto inStartingArea(xi::ZoneId zone) -> bool; // West/East Ronfaure, North/South Gustaberg, West/East Sarutabaruta
+auto otherStartingZone(uint8 nation, xi::ZoneId here) -> std::optional<xi::ZoneId>; // the nation's other starting zone; nation >= 3 uses the pair `here` is in
+auto soloPlace(uint8 level, uint8 nation) -> std::optional<Place>; // a spot in that nation's starting zones; nation >= 3 uses all six
 auto spotNear(xi::ZoneId zone, const position_t& around, float minRadius, float maxRadius) -> position_t;
 auto nearRealPlayer(xi::ZoneId zone, const position_t& pos, float leeway) -> bool; // a real player, not a pool bot, within leeway of pos
 auto leaveForPlayers(const CCharEntity* PChar, const CMobEntity* PMob) -> bool;    // a real player's fight or claim, or within PLAYER_LEEWAY of one outside the party
