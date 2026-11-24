@@ -833,7 +833,7 @@ auto campZoneText(const CCharEntity* PChar, const xi::ZoneId zone) -> std::strin
     {
         return prettyName(PChar->loc.zone->getName());
     }
-    if (const auto* PZone = zoneutils::GetZone(zone))
+    if (auto* PZone = zoneutils::GetZone(zone)) // CZone::getName is not const
     {
         return prettyName(PZone->getName());
     }
