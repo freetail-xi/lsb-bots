@@ -166,6 +166,23 @@ struct NukeWatch
     timer::time_point castAt{};
 };
 
+// A gathering trip at one HELM point. Empty on the bot when it is not on one.
+struct Gather
+{
+    uint32            pointId{};
+    uint16            targid{};
+    std::string       pointName;
+    uint16            tool{};
+    const char*       toolName{}; // "sickle", "hatchet", or "pickaxe"
+    int32             tools{};    // how many it held when the trade went out, to see a break
+    uint8             done{};     // events ended, out of 8
+    uint16            giveTool{}; // restock adds kGatherTools of this once; 0 when it already has one
+    timer::time_point until{};
+    timer::time_point nextTrade{};
+    timer::time_point tradedAt{};
+    bool              waiting{}; // a trade is out; the next event is this gather
+};
+
 struct Bot
 {
     uint32                      charId{};
@@ -228,6 +245,8 @@ struct Bot
     bool                        directed{};      // carrying out one of them: what it was told to stop doesn't apply
     timer::time_point           sessionEnds{};   // log out after this, once the bot is free; unset means no session limit
     std::deque<DiaryLine>       diary;           // oldest first, capped at 8; the bot_pool.diary column
+    std::optional<Gather>       gather;          // a HELM trip; empty when not gathering
+    timer::time_point           nextGather{};    // no new trip before this
 
     auto entity() const -> CCharEntity*;
 };
@@ -236,6 +255,9 @@ struct Bot
 constexpr uint16 kEchoDrops   = 4151;
 constexpr uint16 kPrismPowder = 4164;
 constexpr uint16 kSilentOil   = 4165;
+
+// One stack of a HELM tool (sickle, hatchet, or pickaxe), given when a gathering trip starts and the bot has none.
+constexpr int32 kGatherTools = 12;
 
 // Bots rest below these; pullers wait on them until they've seen what this camp's pulls take (bot_pull.cpp).
 constexpr uint8 kRestHPP = 70;

@@ -557,7 +557,28 @@ void prepare(Bot& bot, sol::state& lua)
 void restock(Bot& bot, sol::state& lua, const timer::time_point tick)
 {
     auto* PChar = bot.entity();
-    if (PChar == nullptr || !throttle(bot, 0x30000, 0, std::chrono::seconds(20), tick))
+    if (PChar == nullptr)
+    {
+        return;
+    }
+
+    // A trip asked for a tool. Same addItem as the stacks below. think() runs after restock, so this is the next tick,
+    // ahead of the 20s throttle. With no trip pending this block does not run.
+    if (bot.gather && bot.gather->giveTool != 0)
+    {
+        const auto tool = bot.gather->giveTool;
+        bot.gather->giveTool = 0;
+        const auto script = fmt::format("local p = GetPlayerByID({})\nif p == nil then return end\n"
+                                        "p:addItem({{ id = {}, quantity = {}, silent = true }})\n",
+                                        PChar->id, tool, kGatherTools);
+        if (const auto result = lua.safe_script(script, sol::script_pass_on_error); !result.valid())
+        {
+            const sol::error err = result;
+            ShowErrorFmt("bots: gathering tool for {} failed: {}", bot.name, err.what());
+        }
+    }
+
+    if (!throttle(bot, 0x30000, 0, std::chrono::seconds(20), tick))
     {
         return;
     }
@@ -565,7 +586,8 @@ void restock(Bot& bot, sol::state& lua, const timer::time_point tick)
     std::string script;
 
     // Loot piles up until nothing fits, ammunition and medicine included; bots have no use for it.
-    if (auto* PBag = PChar->getStorage(LOC_INVENTORY); PBag->GetFreeSlotsCount() < kBagSpare)
+    // A gathering trip keeps its tool and yield; the purge comes back once the trip is over.
+    if (auto* PBag = PChar->getStorage(LOC_INVENTORY); !bot.gather && PBag->GetFreeSlotsCount() < kBagSpare)
     {
         static const std::set<uint16> kKept = { kEchoDrops, kSilentOil, kPrismPowder, kAutomatonOil, static_cast<uint16>(ITEMID::SHIHEI) };
         for (uint8 slot = 1; slot <= PBag->GetSize(); ++slot)

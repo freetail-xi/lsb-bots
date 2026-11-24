@@ -18,6 +18,7 @@
 #include "map/notoriety_container.h"
 #include "map/packet_system.h"
 #include "map/packets/c2s/0x01a_action.h"
+#include "map/packets/c2s/0x036_item_transfer.h"
 #include "map/packets/c2s/0x037_item_use.h"
 #include "map/battlefield.h"
 #include "map/packets/c2s/0x05b_eventend.h"
@@ -38,6 +39,7 @@
 #include "map/party.h"
 #include "map/spell.h"
 #include "map/status_effect_container.h"
+#include "map/utils/charutils.h"
 #include "map/utils/zoneutils.h"
 #include "map/zone.h"
 
@@ -77,6 +79,14 @@ constexpr float kHuntRange       = 30.0f; // how far a bot on its own looks for 
 constexpr auto  kPreyDry         = std::chrono::seconds(60); // solo under SOLO_BELOW: nothing to hunt for this long, then move
 constexpr auto  kPreyMove        = std::chrono::minutes(2);  // and not more often than this
 constexpr float kPreyNear        = 5.0f;                     // close enough to the new spot to start hunting again
+constexpr float kGatherRange     = 80.0f;                    // a visible HELM point at least this close, or the bot does not start
+constexpr float kGatherNear      = 4.0f;                     // stand this close; the server accepts the trade out to 6
+constexpr auto  kGatherGap       = std::chrono::seconds(4);  // between trades
+constexpr auto  kGatherEvent     = std::chrono::seconds(5);  // a trade that opens no event ends the trip
+constexpr auto  kGatherTrip      = std::chrono::minutes(5);
+constexpr auto  kGatherRest      = std::chrono::minutes(10); // after a trip, before another
+constexpr uint8 kGatherTrades    = 8;
+constexpr uint8 kGatherFree      = 3; // stop once fewer inventory slots than this are free
 constexpr auto  kHomepointDelay  = std::chrono::seconds(60);
 constexpr auto  kRaiseWait       = std::chrono::minutes(3);
 constexpr auto  kReturnCap       = std::chrono::minutes(10); // a wiped bot party may walk back this long, then idle
@@ -1092,6 +1102,308 @@ auto seekPrey(Bot& bot, CCharEntity* PChar, const timer::time_point tick) -> boo
     return true;
 }
 
+// Harvesting, logging, mining, excavation. The name is what prettyName makes of the NPC ("Harvesting_Point").
+struct Helm
+{
+    const char* name;
+    uint16      tool;
+    const char* toolName;
+};
+
+constexpr Helm kHelm[] = {
+    { "Harvesting Point", 1020, "sickle" },
+    { "Logging Point", 1021, "hatchet" },
+    { "Mining Point", 605, "pickaxe" },
+    { "Excavation Point", 605, "pickaxe" },
+};
+
+auto toolCount(CCharEntity* PChar, const uint16 itemId) -> int32
+{
+    return static_cast<int32>(charutils::getItemCount(PChar, itemId));
+}
+
+void stopGather(Bot& bot, const timer::time_point tick, const char* reason)
+{
+    if (!bot.gather)
+    {
+        return;
+    }
+    ShowInfoFmt("bots: {} stops gathering: {}", bot.name, reason);
+    bot.gather.reset();
+    bot.nextGather = tick + kGatherRest;
+}
+
+// The yield is already in the inventory. End the cutscene the way any other one ends, then count it.
+void finishGather(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const timer::time_point tick)
+{
+    auto& trip     = *bot.gather;
+    trip.waiting   = false;
+    trip.tradedAt  = {};
+    finishEvent(bot, packets, PChar);
+
+    const auto left = toolCount(PChar, trip.tool);
+    if (trip.tools - left == 1)
+    {
+        ShowInfoFmt("bots: {}'s {} broke", bot.name, trip.toolName);
+    }
+    ++trip.done;
+    ShowInfoFmt("bots: {} gathered at {} ({} of 8)", bot.name, trip.pointName, static_cast<int>(trip.done));
+
+    if (trip.done >= kGatherTrades)
+    {
+        stopGather(bot, tick, "8 trades");
+        return;
+    }
+    if (tick >= trip.until)
+    {
+        stopGather(bot, tick, "5 minutes");
+        return;
+    }
+    if (PChar->getStorage(LOC_INVENTORY)->GetFreeSlotsCount() < kGatherFree)
+    {
+        stopGather(bot, tick, "fewer than 3 free slots");
+        return;
+    }
+    if (left <= 0)
+    {
+        stopGather(bot, tick, "no tool left");
+        return;
+    }
+    trip.tools     = left;
+    trip.nextTrade = tick + kGatherGap;
+}
+
+auto helmOf(CNpcEntity* PNpc) -> const Helm*
+{
+    if (PNpc->status != xi::Status::Normal)
+    {
+        return nullptr;
+    }
+    const auto name = prettyName(PNpc->getName());
+    for (const auto& point : kHelm)
+    {
+        if (name == point.name)
+        {
+            return &point;
+        }
+    }
+    return nullptr;
+}
+
+auto helmVisible(CNpcEntity* PNpc) -> bool
+{
+    return PNpc != nullptr && PNpc->status == xi::Status::Normal;
+}
+
+auto npcById(CCharEntity* PChar, const uint32 id) -> CNpcEntity*
+{
+    CNpcEntity* found = nullptr;
+    PChar->loc.zone->ForEachNpc(
+        [&](CNpcEntity* PNpc)
+        {
+            if (found == nullptr && PNpc->id == id)
+            {
+                found = PNpc;
+            }
+        });
+    return found;
+}
+
+struct HelmPick
+{
+    CNpcEntity* npc{};
+    const Helm* kind{};
+};
+
+// The nearest visible point inside kGatherRange. Hidden points (relocating) are skipped.
+auto nearestHelm(CCharEntity* PChar) -> HelmPick
+{
+    HelmPick best;
+    float    bestDist = kGatherRange;
+    PChar->loc.zone->ForEachNpc(
+        [&](CNpcEntity* PNpc)
+        {
+            const auto* kind = helmOf(PNpc);
+            if (kind == nullptr)
+            {
+                return;
+            }
+            const float dist = distance(PChar->loc.p, PNpc->loc.p);
+            if (dist <= kGatherRange && (best.npc == nullptr || dist < bestDist))
+            {
+                best.npc  = PNpc;
+                best.kind = kind;
+                bestDist  = dist;
+            }
+        });
+    return best;
+}
+
+// Where seekPrey would run, once per hunt look that found nothing: sometimes walk to a point instead.
+// The roll is that look, not every follow tick. No point within 80 yalms, or the roll misses: seekPrey runs as before.
+auto startGather(Bot& bot, CCharEntity* PChar, const timer::time_point tick) -> bool
+{
+    if (bot.citizen || bot.withPlayer || PChar->PParty != nullptr || PChar->PAI->IsEngaged() ||
+        PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing))
+    {
+        return false;
+    }
+    if (tick < bot.nextGather)
+    {
+        return false;
+    }
+
+    const auto chance = settings::get<uint32>("bots.GATHER_CHANCE");
+    if (PChar->getStorage(LOC_INVENTORY)->GetFreeSlotsCount() < kGatherFree)
+    {
+        return false;
+    }
+
+    const auto picked = nearestHelm(PChar);
+    if (picked.npc == nullptr)
+    {
+        return false;
+    }
+    if (xirand::GetRandomNumber<uint32>(100) >= chance)
+    {
+        return false;
+    }
+
+    Gather trip;
+    trip.pointId   = picked.npc->id;
+    trip.targid    = picked.npc->targid;
+    trip.pointName = picked.kind->name;
+    trip.tool      = picked.kind->tool;
+    trip.toolName  = picked.kind->toolName;
+    trip.tools     = toolCount(PChar, trip.tool);
+    trip.until     = tick + kGatherTrip;
+    trip.nextTrade = tick;
+    if (trip.tools <= 0)
+    {
+        trip.giveTool = trip.tool;
+    }
+
+    bot.preySpot.reset();
+    bot.preyDrySince = {};
+    bot.gather       = std::move(trip);
+    ShowInfoFmt("bots: {} goes gathering at {} in {}", bot.name, bot.gather->pointName, campZoneText(PChar, PChar->getZone()));
+    return true;
+}
+
+// Walk to the point, trade one tool, and wait out the event. False once the trip has ended.
+auto onGatherTrip(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const timer::time_point tick) -> bool
+{
+    auto& trip = *bot.gather;
+    if (tick >= trip.until)
+    {
+        stopGather(bot, tick, "5 minutes");
+        return false;
+    }
+    if (PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing))
+    {
+        stopGather(bot, tick, "resting");
+        return false;
+    }
+
+    auto* PNpc = npcById(PChar, trip.pointId);
+    if (trip.waiting)
+    {
+        if (tick - trip.tradedAt >= kGatherEvent)
+        {
+            const auto left = toolCount(PChar, trip.tool);
+            if (trip.tools - left == 1)
+            {
+                ShowInfoFmt("bots: {}'s {} broke", bot.name, trip.toolName);
+            }
+            stopGather(bot, tick, "no event");
+            return false;
+        }
+        if (helmVisible(PNpc))
+        {
+            PChar->PAI->PathFind->Clear();
+            PChar->PAI->PathFind->LookAt(PNpc->loc.p);
+        }
+        return true;
+    }
+
+    if (!helmVisible(PNpc))
+    {
+        stopGather(bot, tick, PNpc == nullptr ? "point gone" : "point hidden");
+        return false;
+    }
+
+    const auto have = toolCount(PChar, trip.tool);
+    if (have <= 0 && trip.giveTool == 0)
+    {
+        stopGather(bot, tick, "no tool left");
+        return false;
+    }
+
+    if (distance(PChar->loc.p, PNpc->loc.p) > kGatherNear)
+    {
+        walkTo(PChar, PNpc->loc.p, kGatherNear, tick);
+        return true;
+    }
+
+    if (PChar->PAI->PathFind->IsFollowingPath())
+    {
+        PChar->PAI->PathFind->Clear();
+    }
+    PChar->PAI->PathFind->LookAt(PNpc->loc.p);
+
+    // The stack arrives from restock on the tick after the trip starts. Stand here until then, and between trades.
+    if (have <= 0 || tick < trip.nextTrade)
+    {
+        return true;
+    }
+    if (PChar->getStorage(LOC_INVENTORY)->GetFreeSlotsCount() < kGatherFree)
+    {
+        stopGather(bot, tick, "fewer than 3 free slots");
+        return false;
+    }
+    if (bot.sitting)
+    {
+        setSitting(bot, packets, false);
+        return true;
+    }
+    if (PChar->isInEvent())
+    {
+        return true;
+    }
+
+    // Slot index for the trade, the same one useItem sends from SearchItem.
+    const auto slot = PChar->getStorage(LOC_INVENTORY)->SearchItem(trip.tool);
+    if (slot == ERROR_SLOTID)
+    {
+        stopGather(bot, tick, "no tool left");
+        return false;
+    }
+
+    trip.tools       = have;
+    auto  packet     = makePacket<GP_CLI_COMMAND_ITEM_TRANSFER>();
+    auto* trade      = packet->as<GP_CLI_COMMAND_ITEM_TRANSFER>();
+    trade->UniqueNo  = PNpc->id;
+    trade->ActIndex  = PNpc->targid;
+    trade->ItemNum   = 1;
+    for (uint8 i = 0; i < 10; ++i)
+    {
+        trade->ItemNumTbl[i]           = 0;
+        trade->PropertyItemIndexTbl[i] = 0;
+    }
+    trade->ItemNumTbl[0]           = 1;
+    trade->PropertyItemIndexTbl[0] = static_cast<uint8>(slot);
+    send(bot, packets, *packet);
+    trip.waiting  = true;
+    trip.tradedAt = tick;
+
+    // The handler usually opens the event before send returns. End it now; the next think does it if not.
+    if (PChar->isInEvent() && PChar->currentEvent->eventId != kEntryEvent)
+    {
+        finishGather(bot, packets, PChar, tick);
+    }
+    return true;
+}
+
 } // namespace
 
 void emote(Bot& bot, PacketSystem& packets, const xi::Emote emote, const CBaseEntity* PTarget)
@@ -1384,6 +1696,10 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
 
     if (PChar->isDead())
     {
+        if (bot.gather)
+        {
+            stopGather(bot, tick, "died");
+        }
         if (bot.diedAt == timer::time_point{})
         {
             bot.diedAt = tick;
@@ -1441,6 +1757,13 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
 
     if (PChar->isInEvent())
     {
+        // A gather trade opened this. End it the same way as any other cutscene, then count the yield.
+        // A battlefield menu, and any event the bot did not just trade for, stays on the path below.
+        if (bot.gather && bot.gather->waiting && PChar->currentEvent->eventId != kEntryEvent)
+        {
+            finishGather(bot, packets, PChar, tick);
+            return;
+        }
         if (!answerEntry(bot, packets, PChar))
         {
             finishEvent(bot, packets, PChar);
@@ -1498,6 +1821,10 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     {
         bot.preySpot.reset();
         bot.preyDrySince = {};
+        if (bot.gather)
+        {
+            stopGather(bot, tick, "joined a party");
+        }
     }
 
     if (bot.citizen)
@@ -1696,6 +2023,10 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
 
     if (PTarget != nullptr)
     {
+        if (bot.gather)
+        {
+            stopGather(bot, tick, "attacked");
+        }
         bot.foughtAt = tick;
 
         if (restInFight(bot, packets, PChar, PTarget, tick))
@@ -1805,6 +2136,10 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
 
     if (act(bot, packets, nullptr, travelling, tick) || (PGuide != nullptr && conceal(bot, packets, PGuide, tick)) || rest(bot, packets, PChar, PLeader, tick))
     {
+        if (bot.gather && PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing))
+        {
+            stopGather(bot, tick, "resting");
+        }
         return;
     }
 
@@ -1839,12 +2174,25 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             return;
         }
 
+        // GATHERING false: the flag is read and both branches are skipped, and hunt, seek, and wander are unchanged.
+        const bool gatheringOn = settings::get<bool>("bots.GATHERING");
+        if (gatheringOn && bot.gather && onGatherTrip(bot, packets, PChar, tick))
+        {
+            return;
+        }
+
         if (settings::get<bool>("bots.HUNT"))
         {
+            const bool looked = tick >= bot.nextHunt;
             if (auto* PPrey = huntTarget(bot, PChar, tick))
             {
                 bot.focusTarget  = PPrey->id;
                 bot.preyDrySince = {};
+                return;
+            }
+            // Nothing to hunt (this is where seekPrey runs). One roll per hunt look, and only if a point is close.
+            if (looked && gatheringOn && !bot.gather && startGather(bot, PChar, tick) && onGatherTrip(bot, packets, PChar, tick))
+            {
                 return;
             }
             // Nothing within 30 yalms: after a minute, walk to another camp. A player's party never gets here.

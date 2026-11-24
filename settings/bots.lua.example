@@ -24,6 +24,11 @@ xi.settings.bots =
     BOT_PARTIES          = true, -- Unpartied bots in a zone with real players sometimes team up and hunt together
     SOLO_BELOW           = 10, -- Bots below this level solo in a starting area and are not put in bot-only parties. 0 turns this off
     SOLO_ACTIVE          = true, -- Those soloing bots hunt even when no real player is in their zone. false keeps them idle until one is, as before
+
+    -- Gathering at a HELM point (harvesting, logging, mining, excavation). false leaves every bot behaving as before.
+    GATHERING            = false, -- Solo bots may gather at a visible point in the zone. false changes nothing
+    GATHER_CHANCE        = 15,    -- Percent. Each time a solo bot has nothing to hunt, the chance it gathers instead if a point is within 80 yalms
+
     INVITE_SEEKERS       = true, -- A bot party at a camp, or in a fight, tells one seeking player it has room for, then invites. A tell of "no invites" stops that until restart
 
     -- Townsfolk. The CITIZENS pool rows with the lowest char ids stay in one city: they walk, sit, and talk,
