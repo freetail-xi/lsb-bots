@@ -331,6 +331,7 @@ void declineInvite(Bot& bot, PacketSystem& packets);
 auto citizenReplyAllowed(const Bot& bot) -> bool; // one model reply per citizen per 20 seconds
 void citizenReplyUsed(const Bot& bot);
 auto sayAddressedToOther(CCharEntity* PSpeaker, const std::string& text) -> bool;
+auto skippedNpc(const std::string& name) -> bool; // pretty name: a machine, object, or later-era system
 
 // bot_combat.cpp
 auto knowsAbility(CCharEntity* PChar, uint16 id) -> bool; // m_Abilities, or m_PetCommands for a blood pact

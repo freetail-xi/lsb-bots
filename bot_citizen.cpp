@@ -81,6 +81,43 @@ constexpr auto  kWalkCap = std::chrono::minutes(2);
 constexpr auto  kSayMemory = std::chrono::minutes(1);
 constexpr float kSayHear = 15.0f;
 
+// Machines, objects, and later-era systems. One list, matched as whole words, ignoring case.
+// "Home Point" is the phrase, so a pretty name ("Home_Point" -> "Home Point") hits it.
+constexpr const char* kSkipNpc[] = {
+    "Synergy",
+    "Furnace",
+    "Ambuscade",
+    "Eminence",
+    "Unity",
+    "Survival",
+    "Guide",
+    "Geomagnetic",
+    "Fount",
+    "Ethereal",
+    "Junction",
+    "Waypoint",
+    "Door",
+    "Gate",
+    "Counter",
+    "Board",
+    "Tome",
+    "Point",
+    "Crystal",
+    "Moogle",
+    "Station",
+    "Home Point",
+    "Rift",
+    "Spatial",
+    "Displacement",
+    "Book",
+    "Statue",
+    "Plaque",
+    "Chest",
+    "Coffer",
+    "Tape",
+    "???",
+};
+
 struct Routine
 {
     enum class Phase : uint8
@@ -131,6 +168,31 @@ auto wantsName(const char* line) -> bool
     return std::string_view(line).find("{name}") != std::string_view::npos;
 }
 
+// {name} is for a stall keeper: one or two words. Spaces split; an apostrophe does not.
+auto shortName(const std::string& name) -> bool
+{
+    int  words  = 0;
+    bool inWord = false;
+    for (const unsigned char c : name)
+    {
+        if (std::isspace(c) != 0)
+        {
+            inWord = false;
+        }
+        else if (!inWord)
+        {
+            inWord = true;
+            ++words;
+        }
+    }
+    return words == 1 || words == 2;
+}
+
+auto greetsNpc(const Routine& routine) -> bool
+{
+    return !routine.home && !routine.name.empty() && routine.name != "home" && shortName(routine.name) && !skippedNpc(routine.name);
+}
+
 // Same half-to-one-and-a-half spread chatter uses, so "about every N minutes" stays about that.
 auto sayJitter(const uint32 minutes) -> std::chrono::seconds
 {
@@ -163,7 +225,8 @@ auto pickStop(Bot& bot, Routine& routine) -> bool
     PChar->loc.zone->ForEachNpc(
         [&](CNpcEntity* PNpc)
         {
-            if (PNpc->status != xi::Status::Normal || PNpc->IsNameHidden() || !hasLetter(prettyName(PNpc->getName())))
+            const auto name = prettyName(PNpc->getName());
+            if (PNpc->status != xi::Status::Normal || PNpc->IsNameHidden() || !hasLetter(name) || skippedNpc(name))
             {
                 return;
             }
@@ -223,7 +286,7 @@ void speak(Bot& bot, Routine& routine, CCharEntity* PChar, const timer::time_poi
     std::vector<int> choices;
     for (int i = 0; i < static_cast<int>(kLines.size()); ++i)
     {
-        if (i == routine.lastLine || (wantsName(kLines[i]) && (routine.home || routine.name.empty() || routine.name == "home")))
+        if (i == routine.lastLine || (wantsName(kLines[i]) && !greetsNpc(routine)))
         {
             continue;
         }
@@ -261,6 +324,20 @@ void speak(Bot& bot, Routine& routine, CCharEntity* PChar, const timer::time_poi
 }
 
 } // namespace
+
+auto skippedNpc(const std::string& name) -> bool
+{
+    const auto hay = lowerCase(name);
+    for (const char* word : kSkipNpc)
+    {
+        const auto needle = lowerCase(word);
+        if (saysPhrase(hay, { needle }))
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 auto citizenIds(const std::vector<PoolEntry>& pool) -> std::set<uint32>
 {

@@ -191,6 +191,16 @@ void setSeeking(Bot& bot, PacketSystem& packets, const bool seeking)
 
 void setResting(Bot& bot, PacketSystem& packets, const bool resting)
 {
+    // /heal is refused while engaged. Standing back up is still sent.
+    if (resting)
+    {
+        auto* PChar = bot.entity();
+        if (PChar != nullptr && PChar->PAI != nullptr && (PChar->PAI->IsEngaged() || PChar->GetBattleTarget() != nullptr))
+        {
+            return;
+        }
+    }
+
     auto packet                                = makePacket<GP_CLI_COMMAND_CAMP>();
     packet->as<GP_CLI_COMMAND_CAMP>()->Mode    = static_cast<uint32_t>(resting ? GP_CLI_COMMAND_CAMP_MODE::On : GP_CLI_COMMAND_CAMP_MODE::Off);
     send(bot, packets, *packet);
@@ -564,10 +574,12 @@ void wander(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const timer::ti
     }
 
     std::vector<position_t> spots;
+    // Same names citizens skip, so a stroll doesn't stop on a furnace, a door, or a home point.
     PChar->loc.zone->ForEachNpc(
         [&](CNpcEntity* PNpc)
         {
-            if (PNpc->status == xi::Status::Normal && !PNpc->IsNameHidden() && distance(PChar->loc.p, PNpc->loc.p) < 100.0f)
+            if (PNpc->status == xi::Status::Normal && !PNpc->IsNameHidden() && !skippedNpc(prettyName(PNpc->getName())) &&
+                distance(PChar->loc.p, PNpc->loc.p) < 100.0f)
             {
                 spots.push_back(PNpc->loc.p);
             }
@@ -781,6 +793,11 @@ auto rest(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLea
     const bool draining = PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::SublimationActivated) || PChar->getMod(xi::Mod::REGEN_DOWN) > 0;
     if ((low || (caster && leaderResting && !full)) && !heal && settled && !draining && canAct(PChar))
     {
+        // Still engaged, or still holding a target: /heal would be refused. Skip this tick.
+        if (PChar->PAI->IsEngaged() || PChar->GetBattleTarget() != nullptr)
+        {
+            return false;
+        }
         PChar->PAI->PathFind->Clear();
         setResting(bot, packets, true);
         return true;
@@ -814,6 +831,19 @@ auto restInFight(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CBattleEnt
 
     if (PChar->GetMPP() < kFightRestMPP && !attacked && !wanted && canAct(PChar))
     {
+        // The server refuses /heal while engaged. Disengage first; camp once that has landed.
+        if (PChar->PAI->IsEngaged() || PChar->GetBattleTarget() != nullptr)
+        {
+            if (PChar->PAI->IsEngaged())
+            {
+                disengage(bot, packets);
+            }
+            if (PChar->PAI->IsEngaged() || PChar->GetBattleTarget() != nullptr)
+            {
+                return true;
+            }
+        }
+
         if (throttle(bot, kOutOfMPKey, PTarget->id, std::chrono::minutes(5), tick))
         {
             ShowInfoFmt("bots: {} ({} {}) sits down at {}% MP fighting {} ({}% HP)", PChar->getName(), job == xi::Job::WHM ? "WHM" : "BLM", PChar->GetMLevel(),
