@@ -11,6 +11,7 @@
 #include "common/cbasetypes.h"
 #include "common/mmo.h"
 #include "common/timer.h"
+#include "data/enums/emote.h"
 #include "data/enums/zone.h"
 
 #include "map/entities/entity_id.h"
@@ -183,6 +184,7 @@ struct Bot
     bool                        withPlayer{};    // its party has had a real player in it
     uint8                       preparedLevel{}; // level its spells and gear were set for
     position_t                  home{};          // where it logged in, for idle wandering
+    bool                        citizen{};       // townsfolk: one city, no parties, hunts, or camps
     timer::time_point           nextWander{};
     position_t                  leaderLast{};    // leader position last tick, to tell when they stop
     bool                        seeking{};        // the /sea seeking-party flag is on
@@ -290,7 +292,20 @@ void rangedAttack(Bot& bot, PacketSystem& packets, const CBaseEntity* PTarget);
 auto useItem(Bot& bot, PacketSystem& packets, uint16 itemId, const CBaseEntity* PTarget) -> bool;
 void engage(Bot& bot, PacketSystem& packets, const CBaseEntity* PTarget);
 void disengage(Bot& bot, PacketSystem& packets);
+void emote(Bot& bot, PacketSystem& packets, xi::Emote emote, const CBaseEntity* PTarget = nullptr);
+void setSitting(Bot& bot, PacketSystem& packets, bool sitting);
 void walkTo(CCharEntity* PChar, const position_t& pos, float within, timer::time_point tick);
+
+// bot_citizen.cpp — pool bots who live in one city. CITIZENS 0 leaves every hook dormant.
+auto citizenIds(const std::vector<PoolEntry>& pool) -> std::set<uint32>; // lowest char ids, at most CITIZENS
+void placeCitizen(uint32 charId);                                        // CITIZEN_ZONE, beside a named NPC
+void noteCitizenLogin(uint32 charId);
+void citizenAct(Bot& bot, PacketSystem& packets, timer::time_point tick);
+void citizenPause(Bot& bot); // a player left the zone: the next walk is staggered again
+void declineInvite(Bot& bot, PacketSystem& packets);
+auto citizenReplyAllowed(const Bot& bot) -> bool; // one model reply per citizen per 20 seconds
+void citizenReplyUsed(const Bot& bot);
+auto sayAddressedToOther(CCharEntity* PSpeaker, const std::string& text) -> bool;
 
 // bot_combat.cpp
 auto knowsAbility(CCharEntity* PChar, uint16 id) -> bool; // m_Abilities, or m_PetCommands for a blood pact
@@ -412,6 +427,7 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, ti
 void deliverChat(std::vector<Bot>& online, PacketSystem& packets);
 void callout(const Bot& bot, const std::string& text, bool macro);
 void tell(const Bot& bot, const std::string& to, const std::string& text);
+auto sayCanned(const Bot& bot, const std::string& text) -> bool; // a fixed /say, logged by say()
 void refuseInvites(uint32 charId);       // a tell of "no invites": not asked again until the server restarts
 auto invitesRefused(uint32 charId) -> bool;
 void greet(const Bot& bot);

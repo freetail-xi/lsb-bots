@@ -84,8 +84,6 @@ constexpr auto  kPlayerGoneGrace = std::chrono::seconds(20);
 constexpr uint32 kAttackKey      = 0x30000;
 constexpr uint32 kOutOfMPKey     = 0xB0000; // the mid-fight rest log, once a fight
 
-void setSitting(Bot& bot, PacketSystem& packets, const bool sitting);
-
 void sendAction(Bot& bot, PacketSystem& packets, const GP_CLI_COMMAND_ACTION_ACTIONID actionId, const CBaseEntity* PTarget, const uint32 param = 0)
 {
     // The server refuses these while /healing, and while the sit animation is up ("Character in invalid animation state").
@@ -396,18 +394,6 @@ void follow(CCharEntity* PChar, CCharEntity* PLeader, const timer::time_point ti
     moveToward(PChar, PLeader->loc.p, kFollowDistance, tick);
 }
 
-void emote(Bot& bot, PacketSystem& packets, const xi::Emote emote, const CBaseEntity* PTarget = nullptr)
-{
-    auto  packet       = makePacket<GP_CLI_COMMAND_MOTION>();
-    auto* motion       = packet->as<GP_CLI_COMMAND_MOTION>();
-    // No target for an emote at nobody: aimed at itself it reads "looks at <name>".
-    motion->UniqueNo   = PTarget != nullptr ? PTarget->id : 0;
-    motion->ActIndex   = PTarget != nullptr ? PTarget->targid : 0;
-    motion->Number     = static_cast<uint8_t>(emote);
-    motion->Mode       = static_cast<uint8_t>(xi::EmoteMode::All);
-    send(bot, packets, *packet);
-}
-
 // A fitting emote back for a player's, or none.
 auto emoteReply(const xi::Emote theirs) -> std::optional<xi::Emote>
 {
@@ -439,14 +425,6 @@ auto emoteReply(const xi::Emote theirs) -> std::optional<xi::Emote>
         return std::nullopt;
     }
     return it->second[xirand::GetRandomNumber<std::size_t>(it->second.size())];
-}
-
-void setSitting(Bot& bot, PacketSystem& packets, const bool sitting)
-{
-    auto packet                             = makePacket<GP_CLI_COMMAND_SIT>();
-    packet->as<GP_CLI_COMMAND_SIT>()->Mode  = static_cast<uint32_t>(sitting ? GP_CLI_COMMAND_SIT_MODE::On : GP_CLI_COMMAND_SIT_MODE::Off);
-    send(bot, packets, *packet);
-    bot.sitting = sitting;
 }
 
 // In town a bot strolls from one NPC to another (shops, the auction house, guards) and hangs about there,
@@ -988,6 +966,26 @@ void startHeadOut(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, 
 
 } // namespace
 
+void emote(Bot& bot, PacketSystem& packets, const xi::Emote emote, const CBaseEntity* PTarget)
+{
+    auto  packet       = makePacket<GP_CLI_COMMAND_MOTION>();
+    auto* motion       = packet->as<GP_CLI_COMMAND_MOTION>();
+    // No target for an emote at nobody: aimed at itself it reads "looks at <name>".
+    motion->UniqueNo   = PTarget != nullptr ? PTarget->id : 0;
+    motion->ActIndex   = PTarget != nullptr ? PTarget->targid : 0;
+    motion->Number     = static_cast<uint8_t>(emote);
+    motion->Mode       = static_cast<uint8_t>(xi::EmoteMode::All);
+    send(bot, packets, *packet);
+}
+
+void setSitting(Bot& bot, PacketSystem& packets, const bool sitting)
+{
+    auto packet                            = makePacket<GP_CLI_COMMAND_SIT>();
+    packet->as<GP_CLI_COMMAND_SIT>()->Mode = static_cast<uint32_t>(sitting ? GP_CLI_COMMAND_SIT_MODE::On : GP_CLI_COMMAND_SIT_MODE::Off);
+    send(bot, packets, *packet);
+    bot.sitting = sitting;
+}
+
 auto Bot::entity() const -> CCharEntity*
 {
     return session ? session->PChar.get() : nullptr;
@@ -1268,8 +1266,11 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             }
         }
 
-        // Before anyone homepoints. A party with a real player does not take a copy.
-        rememberCamp(bot, PChar, botIds);
+        // Before anyone homepoints. A party with a real player does not take a copy. Citizens have no camp to copy.
+        if (!bot.citizen)
+        {
+            rememberCamp(bot, PChar, botIds);
+        }
 
         // Take a raise when one is offered; wait longer for one when someone in the party, or close by, could cast it.
         if (PChar->m_hasRaise)
@@ -1284,7 +1285,10 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
                 bot.homeNoted = true;
                 noteEvent(bot, "homepointed");
             }
-            startReturn(bot, PChar, botIds, tick);
+            if (!bot.citizen)
+            {
+                startReturn(bot, PChar, botIds, tick);
+            }
             sendAction(bot, packets, GP_CLI_COMMAND_ACTION_ACTIONID::HomepointMenu, PChar);
         }
         return;
@@ -1361,7 +1365,15 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         }
     }
 
-    if (PChar->InvitePending.entity.UniqueNo != 0 && PChar->PParty == nullptr)
+    if (bot.citizen)
+    {
+        bot.invites.clear();
+        if (PChar->InvitePending.entity.UniqueNo != 0 && PChar->PParty == nullptr)
+        {
+            declineInvite(bot, packets);
+        }
+    }
+    else if (PChar->InvitePending.entity.UniqueNo != 0 && PChar->PParty == nullptr)
     {
         acceptInvite(bot, packets);
     }
@@ -1384,7 +1396,7 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     }
 
     // Idle in a zone with nobody real: don't advertise on /sea. Those bots won't move until someone arrives.
-    const bool wantSeek = active && PChar->PParty == nullptr;
+    const bool wantSeek = active && PChar->PParty == nullptr && !bot.citizen;
     if (!bot.seekingApplied || bot.seeking != wantSeek)
     {
         setSeeking(bot, packets, wantSeek);
@@ -1394,6 +1406,10 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
 
     auto* PLeader = leaderOf(PChar);
     auto* PGuide  = partner(PChar, bot.followId, PLeader);
+    if (bot.citizen)
+    {
+        bot.focusTarget = 0;
+    }
     auto* PTarget = combatTarget(bot, PChar, partner(PChar, bot.assistId, PLeader));
 
     if (bot.sitting && (PTarget != nullptr || PLeader != nullptr))
@@ -1440,13 +1456,20 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         }
     }
 
-    joinOuting(bot, PChar, botIds, tick);
-    startHeadOut(bot, PChar, botIds, tick);
+    if (!bot.citizen)
+    {
+        joinOuting(bot, PChar, botIds, tick);
+        startHeadOut(bot, PChar, botIds, tick);
+    }
 
     // No real player around to see it: the bot stands idle, only fighting back if something attacks it.
     // A party still walking back to its camp is exempt until the clear above.
     if (!active && bot.returnUntil == timer::time_point{} && (PTarget == nullptr || PTarget->GetBattleTarget() != PChar))
     {
+        if (bot.citizen)
+        {
+            citizenPause(bot);
+        }
         PChar->PAI->PathFind->Clear();
         return;
     }
@@ -1520,18 +1543,18 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     }
 
     // Something attacking a bot left outside a battlefield still gets fought.
-    if (followIn(bot, packets, PChar, PLeader, tick) && PTarget == nullptr)
+    if (!bot.citizen && followIn(bot, packets, PChar, PLeader, tick) && PTarget == nullptr)
     {
         return;
     }
 
-    if (followOrder(bot, packets, tick))
+    if (!bot.citizen && followOrder(bot, packets, tick))
     {
         PChar->PAI->PathFind->Clear();
         return;
     }
 
-    if (pull(bot, packets, PChar, PLeader, tick))
+    if (!bot.citizen && pull(bot, packets, PChar, PLeader, tick))
     {
         return;
     }
@@ -1632,6 +1655,13 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     if (PChar->PAI->IsEngaged())
     {
         sendAction(bot, packets, GP_CLI_COMMAND_ACTION_ACTIONID::AttackOff, PChar);
+    }
+
+    // Townsfolk: the city routine instead of hunt, wander, camp, and follow. A fight above still runs.
+    if (bot.citizen)
+    {
+        citizenAct(bot, packets, tick);
+        return;
     }
 
     // Following a leader who is moving, or still catching up: no casting that would stop the bot.

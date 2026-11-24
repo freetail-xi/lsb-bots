@@ -23,6 +23,13 @@ xi.settings.bots =
     HUNT                 = true, -- Bots without a party hunt monsters near their level, in zones with real players
     BOT_PARTIES          = true, -- Unpartied bots in a zone with real players sometimes team up and hunt together
     INVITE_SEEKERS       = true, -- A bot party at a camp, or in a fight, tells one seeking player it has room for, then invites. A tell of "no invites" stops that until restart
+
+    -- Townsfolk. The CITIZENS pool rows with the lowest char ids stay in one city: they walk, sit, and talk,
+    -- and they never party, hunt, or leave. 0 turns the feature off, and then nothing else changes.
+    CITIZENS            = 0,   -- How many pool bots are citizens. They log in first and count toward MAX_ONLINE
+    CITIZEN_ZONE        = 230, -- The city they live in (Southern San d'Oria)
+    CITIZEN_SAY_MINUTES = 4,   -- About how often each citizen speaks in /say, and only with a real player within 30 yalms. 0 turns it off
+
     PLAYER_LEEWAY        = 40, -- Yalms. Bots leave a real player's mobs alone inside this, and aren't placed this close. They still fight back
     LEVEL_WINDOW         = 10, -- Levels. Balance won't send a bot further than this from the player; invites use it, and logins prefer it
 

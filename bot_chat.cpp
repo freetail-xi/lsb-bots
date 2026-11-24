@@ -202,6 +202,11 @@ auto isShout(const uint8 kind) -> bool
     return kind == MESSAGE_SHOUT || kind == MESSAGE_NS_SHOUT;
 }
 
+auto isSay(const uint8 kind) -> bool
+{
+    return kind == MESSAGE_SAY || kind == MESSAGE_NS_SAY;
+}
+
 auto channelName(const uint8 kind) -> const char*
 {
     switch (kind)
@@ -748,7 +753,7 @@ auto describe(const Bot& bot, const bool places = false, const bool sentInvite =
     };
 
     // Rebuilt for every reply, so the model always sees the party and the fight as they are right now.
-    std::string doing = PChar->PParty ? "in a party" : "looking for a party";
+    std::string doing = bot.citizen ? "at home in the city" : (PChar->PParty ? "in a party" : "looking for a party");
     std::string situation;
     CBattleEntity* PFight = PChar->PAI->IsEngaged() ? PChar->GetBattleTarget() : nullptr;
     if (PChar->PParty)
@@ -832,7 +837,7 @@ auto describe(const Bot& bot, const bool places = false, const bool sentInvite =
                          : fmt::format("no subjob yet (they come at level {})", settings::get<uint8>("main.SUBJOB_QUEST_LEVEL"));
     const auto inviteLine = sentInvite ? "If someone wants to party, you've already sent them an invite."
                                         : "If someone wants to party, you have not sent an invite.";
-    return fmt::format("You're {0}, playing Final Fantasy XI on a small private server: {1} {2} level {3}, {11}, from {9}.\n"
+    auto prompt = fmt::format("You're {0}, playing Final Fantasy XI on a small private server: {1} {2} level {3}, {11}, from {9}.\n"
                        "Right now: {4}, {5}.{6}\n"
                        "{10}{7}\n"
                        "You: {8}\n\n"
@@ -847,6 +852,11 @@ auto describe(const Bot& bot, const bool places = false, const bool sentInvite =
                        bot.name, race, job < jobs.size() ? jobs[job] : "adventurer", PChar->GetMLevel(), zone, doing, health,
                        places ? fmt::format("\nGood places at your level: {}.", camps) : std::string(), personalityOf(bot),
                        nation < nations.size() ? nations[nation] : "San d'Oria", nearbyMonsters(PChar), sub, inviteLine);
+    if (bot.citizen)
+    {
+        prompt += "\nYou are a resident of this city. You do not adventure.";
+    }
+    return prompt;
 }
 
 auto request(const Bot& bot, const uint8 kind, const std::string& to, const bool optional, const std::string& system, const std::string& prompt,
@@ -922,6 +932,10 @@ auto request(const Bot& bot, const uint8 kind, const std::string& to, const bool
 
 void ask(const Bot& bot, const Heard& heard, const bool optional, const std::string& note = {}, const bool sentInvite = true)
 {
+    if (bot.citizen && !citizenReplyAllowed(bot))
+    {
+        return;
+    }
     if (optional && !feelsLikeTalking(bot))
     {
         return;
@@ -950,6 +964,10 @@ void ask(const Bot& bot, const Heard& heard, const bool optional, const std::str
     }
     if (request(bot, heard.kind, heard.from, optional, system, {}, stamp, cancel))
     {
+        if (bot.citizen)
+        {
+            citizenReplyUsed(bot);
+        }
         prior = Asked{ chatTick, now, heard.from, stamp };
     }
 }
@@ -984,7 +1002,14 @@ auto say(Bot& bot, PacketSystem& packets, const Reply& reply) -> bool
     }
 
     const auto where = isTell(reply.kind) ? fmt::format("tell to {}", reply.to) : std::string(channelName(reply.kind));
-    ShowInfoFmt("bots: {} says ({}): {}", bot.name, where, reply.text);
+    if (bot.citizen && (reply.kind == MESSAGE_SAY || reply.kind == MESSAGE_NS_SAY))
+    {
+        ShowInfoFmt("bots: {} (citizen) says: {}", bot.name, reply.text);
+    }
+    else
+    {
+        ShowInfoFmt("bots: {} says ({}): {}", bot.name, where, reply.text);
+    }
 
     if (isTell(reply.kind))
     {
@@ -1254,7 +1279,9 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
 
         // A request from a party member ("protect please", "provoke that") is carried out, and only the bot doing it answers.
         // Party lines go to the brain and are answered once it decides; tells, and party lines when it's off, use the keyword parser.
-        if (isParty(kind) || isTell(kind))
+        // A tell to a citizen is only conversation: they don't take orders to pull, camp, or join in.
+        const bool citizenTell = isTell(kind) && std::ranges::all_of(listeners, [](const Listener& listener) { return listener.bot->citizen; });
+        if ((isParty(kind) || isTell(kind)) && !citizenTell)
         {
             std::vector<Bot*> hearing;
             for (const auto& listener : listeners)
@@ -1360,6 +1387,8 @@ void respond(std::vector<Listener>& listeners)
 
     bool named = false;
     std::set<uint32> answered;
+    const Listener* citizenSay = nullptr;
+    std::size_t     citizenAt  = std::string::npos;
     for (const auto& listener : listeners)
     {
         if (isTell(kind) || mentions(listener.heard.text, listener.bot->name))
@@ -1369,6 +1398,19 @@ void respond(std::vector<Listener>& listeners)
                 continue;
             }
             named = true;
+            if (listener.bot->citizen && isSay(kind))
+            {
+                if (citizenReplyAllowed(*listener.bot))
+                {
+                    const auto at = lower(listener.heard.text).find(lower(listener.bot->name));
+                    if (citizenSay == nullptr || at < citizenAt)
+                    {
+                        citizenSay = &listener;
+                        citizenAt  = at;
+                    }
+                }
+                continue;
+            }
             if (isTell(kind) && wantsPearl(listener.heard.text))
             {
                 if (offersPearls(*listener.bot))
@@ -1382,6 +1424,11 @@ void respond(std::vector<Listener>& listeners)
                 }
                 continue;
             }
+            if (listener.bot->citizen)
+            {
+                answer(listener, false, "", false, false);
+                continue;
+            }
             const bool party  = wantsParty(listener.heard.text) && !saysNoInvites(listener.heard.text);
             const bool invite = party && levelNear(listener.bot->entity(), listener.heard.from);
             answer(listener, false, party && !invite ? "You have not sent them an invite." : "", !party || invite, party);
@@ -1390,6 +1437,11 @@ void respond(std::vector<Listener>& listeners)
                 listener.bot->invites.push_back(listener.heard.from);
             }
         }
+    }
+
+    if (citizenSay != nullptr)
+    {
+        ask(*citizenSay->bot, citizenSay->heard, false, {}, false);
     }
 
     // A follow-up ("thank you") goes to the bot the speaker was just talking to.
@@ -1414,6 +1466,37 @@ void respond(std::vector<Listener>& listeners)
     }
     else if (isBroadcast(kind) && !named)
     {
+        if (isSay(kind))
+        {
+            // Nobody was named: one citizen within 6 yalms answers, if the line isn't aimed at someone else.
+            const Listener* near = nullptr;
+            float           best = 7.0f;
+            auto*           PSpeaker = zoneutils::GetCharByName(listeners.front().heard.from);
+            if (PSpeaker != nullptr && PSpeaker->loc.zone != nullptr && !sayAddressedToOther(PSpeaker, listeners.front().heard.text))
+            {
+                for (const auto& listener : listeners)
+                {
+                    auto* PChar = listener.bot->entity();
+                    if (!listener.bot->citizen || PChar == nullptr || PChar->isDead() || PChar->getZone() != PSpeaker->getZone() ||
+                        !citizenReplyAllowed(*listener.bot))
+                    {
+                        continue;
+                    }
+                    const float away = distance(PChar->loc.p, PSpeaker->loc.p);
+                    if (away <= 6.0f && away < best)
+                    {
+                        near = &listener;
+                        best = away;
+                    }
+                }
+            }
+            if (near != nullptr)
+            {
+                ask(*near->bot, near->heard, false, {}, false);
+                return;
+            }
+        }
+
         // Someone looking for a group out loud gets one invite, from a bot without a party whose level is close.
         // A bot further than LEVEL_WINDOW does not take that invite, and does not block one who is close enough.
         const bool party   = wantsParty(listeners.front().heard.text) && !saysNoInvites(listeners.front().heard.text);
@@ -1423,7 +1506,7 @@ void respond(std::vector<Listener>& listeners)
         {
             for (auto it = listeners.begin(); it != listeners.end(); ++it)
             {
-                if (it->bot->entity()->PParty != nullptr)
+                if (it->bot->citizen || it->bot->entity()->PParty != nullptr)
                 {
                     continue;
                 }
@@ -1439,6 +1522,10 @@ void respond(std::vector<Listener>& listeners)
         // One reply per bot. A party shout stays a shout; any other shout goes out as a tell.
         for (std::size_t i = 0; i < listeners.size() && answered.size() < 2; ++i)
         {
+            if (listeners[i].bot->citizen)
+            {
+                continue;
+            }
             if (!answered.insert(listeners[i].bot->charId).second)
             {
                 continue;
@@ -1551,7 +1638,7 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, co
             std::vector<Bot*> wearers;
             for (auto& bot : online)
             {
-                if (offersPearls(bot) && !bot.entity()->isDead())
+                if (offersPearls(bot) && !bot.citizen && !bot.entity()->isDead())
                 {
                     wearers.push_back(&bot);
                 }
@@ -1578,7 +1665,7 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, co
     for (auto& bot : online)
     {
         auto* PChar = bot.entity();
-        if (PChar == nullptr || PChar->loc.zone == nullptr || PChar->isDead())
+        if (PChar == nullptr || PChar->loc.zone == nullptr || PChar->isDead() || bot.citizen)
         {
             continue;
         }
@@ -1705,6 +1792,23 @@ void tell(const Bot& bot, const std::string& to, const std::string& text)
 {
     std::lock_guard lock(shared.mutex);
     shared.replies.push_back({ bot.charId, MESSAGE_TELL, to, text, timer::now() });
+}
+
+// A fixed /say. say() logs it. Quiet-down still holds. False when it was not queued.
+auto sayCanned(const Bot& bot, const std::string& text) -> bool
+{
+    if (text.empty())
+    {
+        return false;
+    }
+    if (const auto quiet = quietUntil.find(bot.charId); quiet != quietUntil.end() && timer::now() < quiet->second)
+    {
+        return false;
+    }
+
+    std::lock_guard lock(shared.mutex);
+    shared.replies.push_back({ bot.charId, MESSAGE_SAY, {}, text, timer::now(), false, true });
+    return true;
 }
 
 } // namespace bots

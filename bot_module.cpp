@@ -339,6 +339,11 @@ class BotModule : public CPPModule
             return false;
         }
 
+        if (it->citizen)
+        {
+            return false;
+        }
+
         // An invite from a search result goes out as an alliance invite when the target leads a party.
         // Bots never accept those, so it becomes a party invite.
         if (invite->Kind == PartyKind::Alliance)
@@ -418,11 +423,19 @@ class BotModule : public CPPModule
         {
             // Over the cap with players still on: only bots outside a party go.
             nextLogout_   = now + std::chrono::seconds(1);
-            const auto it = std::ranges::find_if(online_.rbegin(), online_.rend(),
-                                                 [&](const auto& bot)
-                                                 {
-                                                     return target == 0 || isFree(bot);
-                                                 });
+            const auto drop = [&](const bots::Bot& bot)
+            {
+                return target == 0 || isFree(bot);
+            };
+            auto it = online_.rend();
+            if (target != 0)
+            {
+                it = std::ranges::find_if(online_.rbegin(), online_.rend(), [&](const bots::Bot& bot) { return drop(bot) && !bot.citizen; });
+            }
+            if (it == online_.rend())
+            {
+                it = std::ranges::find_if(online_.rbegin(), online_.rend(), drop);
+            }
             if (it != online_.rend())
             {
                 logout(*it);
@@ -544,8 +557,28 @@ class BotModule : public CPPModule
     }
 
     // Least-represented job first, so the online set stays mixed.
+    // Citizens (lowest char ids) log in before anyone else, and never at a camp.
     void loginNext()
     {
+        const auto citizens = bots::citizenIds(pool_);
+        if (!citizens.empty())
+        {
+            const bots::PoolEntry* citizen = nullptr;
+            for (const auto& entry : pool_)
+            {
+                if (citizens.contains(entry.charId) && available(entry) && (citizen == nullptr || entry.charId < citizen->charId))
+                {
+                    citizen = &entry;
+                }
+            }
+            if (citizen != nullptr)
+            {
+                bots::placeCitizen(citizen->charId);
+                login(*citizen);
+                return;
+            }
+        }
+
         std::map<uint8, std::size_t> jobsOnline;
         for (const auto& bot : online_)
         {
@@ -569,7 +602,7 @@ class BotModule : public CPPModule
         bool                                bestNear = false;
         for (const auto& entry : pool_)
         {
-            if (!available(entry))
+            if (!available(entry) || citizens.contains(entry.charId))
             {
                 continue;
             }
@@ -627,7 +660,7 @@ class BotModule : public CPPModule
         for (auto& bot : online_)
         {
             auto* PChar = bot.entity();
-            if (PChar != nullptr && PChar->PParty == nullptr && PChar->loc.zone != nullptr && !PChar->isDead() && PChar->status == xi::Status::Normal &&
+            if (PChar != nullptr && !bot.citizen && PChar->PParty == nullptr && PChar->loc.zone != nullptr && !PChar->isDead() && PChar->status == xi::Status::Normal &&
                 (activeEverywhere || occupied.contains(PChar->getZone())) && bot.invites.empty())
             {
                 byZone[PChar->getZone()].push_back(&bot);
@@ -702,7 +735,7 @@ class BotModule : public CPPModule
         for (auto& bot : online_)
         {
             auto* PChar = bot.entity();
-            if (PChar == nullptr || PChar->loc.zone == nullptr || PChar->PParty == nullptr || PChar->PParty->GetLeader() != PChar || PChar->PParty->IsFull() ||
+            if (PChar == nullptr || bot.citizen || PChar->loc.zone == nullptr || PChar->PParty == nullptr || PChar->PParty->GetLeader() != PChar || PChar->PParty->IsFull() ||
                 !bot.invites.empty())
             {
                 continue;
@@ -849,7 +882,7 @@ class BotModule : public CPPModule
                           }
 
                           const auto bot = std::ranges::find_if(online_, [&](const bots::Bot& candidate) { return candidate.charId == due.charId; });
-                          if (bot != online_.end() && bot->entity() != nullptr)
+                          if (bot != online_.end() && !bot->citizen && bot->entity() != nullptr)
                           {
                               auto*       PLeader = bot->entity();
                               const auto* PPlayer = zoneutils::GetCharByName(due.name);
@@ -885,16 +918,18 @@ class BotModule : public CPPModule
             return;
         }
 
-        const auto window = static_cast<int>(settings::get<uint32>("bots.LEVEL_WINDOW"));
-        const auto leeway = static_cast<float>(settings::get<uint32>("bots.PLAYER_LEEWAY"));
-        const auto zones  = bots::playerZones(poolIds_);
+        const auto window   = static_cast<int>(settings::get<uint32>("bots.LEVEL_WINDOW"));
+        const auto leeway   = static_cast<float>(settings::get<uint32>("bots.PLAYER_LEEWAY"));
+        const auto zones    = bots::playerZones(poolIds_);
+        const auto citizens = bots::citizenIds(pool_);
+        const bool citizenWaiting = std::ranges::any_of(pool_, [&](const auto& entry) { return citizens.contains(entry.charId) && available(entry); });
 
         for (const auto& [zone, players] : zones)
         {
             const auto here = std::ranges::count_if(online_,
                                                     [&](const auto& bot)
                                                     {
-                                                        return bot.entity() != nullptr && !bot.withPlayer && bot.entity()->getZone() == zone;
+                                                        return bot.entity() != nullptr && !bot.citizen && !bot.withPlayer && bot.entity()->getZone() == zone;
                                                     });
             if (static_cast<uint32>(here) >= wantedPerZone)
             {
@@ -922,12 +957,12 @@ class BotModule : public CPPModule
                 return std::abs(static_cast<int>(level) - static_cast<int>(players.level));
             };
 
-            if (online_.size() < settings::get<uint32>("bots.MAX_ONLINE"))
+            if (!citizenWaiting && online_.size() < settings::get<uint32>("bots.MAX_ONLINE"))
             {
                 const bots::PoolEntry* best = nullptr;
                 for (const auto& entry : pool_)
                 {
-                    if (available(entry) && (best == nullptr || gap(entry.level) < gap(best->level)))
+                    if (available(entry) && !citizens.contains(entry.charId) && (best == nullptr || gap(entry.level) < gap(best->level)))
                     {
                         best = &entry;
                     }
@@ -946,7 +981,7 @@ class BotModule : public CPPModule
             for (auto& bot : online_)
             {
                 auto* PChar = bot.entity();
-                if (isFree(bot) && PChar->loc.zone != nullptr && PChar->status == xi::Status::Normal && !zones.contains(PChar->getZone()) &&
+                if (isFree(bot) && !bot.citizen && PChar->loc.zone != nullptr && PChar->status == xi::Status::Normal && !zones.contains(PChar->getZone()) &&
                     (best == nullptr || gap(PChar->GetMLevel()) < gap(best->entity()->GetMLevel())))
                 {
                     best = &bot;
@@ -971,6 +1006,11 @@ class BotModule : public CPPModule
             .name   = entry->name,
             .job    = entry->job,
         };
+        bot.citizen = bots::citizenIds(pool_).contains(entry->charId);
+        if (bot.citizen)
+        {
+            bots::noteCitizenLogin(bot.charId);
+        }
 
         bot.session                   = std::make_unique<MapSession>();
         bot.session->scheduler        = scheduler_;
@@ -999,7 +1039,8 @@ class BotModule : public CPPModule
             bots::prepare(bot, lua);
         }
 
-        if (const auto minutes = sessionMinutes())
+        const auto minutes = bot.citizen ? std::optional<uint32>{} : sessionMinutes();
+        if (minutes)
         {
             bot.sessionEnds = timer::now() + std::chrono::minutes(*minutes);
             ShowInfoFmt("bots: {} logged in for {} minutes ({} online)", bot.name, *minutes, online_.size() + 1);
@@ -1137,7 +1178,7 @@ class BotModule : public CPPModule
     // returnUntil is the same bar: a party walking back from a wipe is not free.
     auto canEndSession(const bots::Bot& bot, const CCharEntity* PChar) const -> bool
     {
-        if (bot.withPlayer || !isFree(bot))
+        if (bot.citizen || bot.withPlayer || !isFree(bot))
         {
             return false;
         }
@@ -1182,7 +1223,7 @@ class BotModule : public CPPModule
         std::vector<bots::Bot*> free;
         for (auto& bot : online_)
         {
-            if (isFree(bot))
+            if (isFree(bot) && !bot.citizen)
             {
                 free.push_back(&bot);
             }
