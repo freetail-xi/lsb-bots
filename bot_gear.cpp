@@ -2,7 +2,8 @@
 // Bot preparation: capped skills, every spell the job knows at its level, and gear.
 //
 //   Run at login and whenever the bot's level changes. Gear is the highest-level
-//   item each slot can take for the job and race; weapons by damage per delay.
+//   item each slot can take for the job and race, biased toward that job's stats;
+//   weapons by damage per delay, with the same bias.
 //
 
 #include "bots.h"
@@ -136,9 +137,44 @@ auto usable(const CItemEquipment* PItem, const xi::Job job, const uint8 level, c
            (PItem->getJobs() & (1u << (static_cast<uint8>(job) - 1))) != 0 && PItem->isEquippableByRace(race);
 }
 
-auto armourScore(const CItemEquipment* PItem) -> int32
+// Added on top of the old score. Never negative, so a slot the old score would fill still fills.
+auto jobBias(const CItemEquipment* PItem, const xi::Job job) -> int32
 {
-    return PItem->getReqLvl() * 1000 + PItem->getModifier(xi::Mod::DEF) * 10 + PItem->getModifier(xi::Mod::HP) + PItem->getModifier(xi::Mod::MP);
+    const auto mod = [&](const xi::Mod id) -> int32
+    {
+        const auto amount = PItem->getModifier(id);
+        return amount > 0 ? amount : 0;
+    };
+
+    // Accuracy and gear haste, on every job, when the piece actually has them.
+    int32 bias = mod(xi::Mod::ACC) * 25 + mod(xi::Mod::RACC) * 25 + mod(xi::Mod::HASTE_GEAR);
+
+    switch (job)
+    {
+        case xi::Job::WHM:
+        case xi::Job::RDM:
+        case xi::Job::BRD:
+        case xi::Job::SMN:
+            bias += mod(xi::Mod::MND) * 50 + mod(xi::Mod::CHR) * 50;
+            bias += mod(xi::Mod::CURE_POTENCY) * 80 + mod(xi::Mod::HEALING) * 15 + mod(xi::Mod::MACC) * 25;
+            break;
+        case xi::Job::BLM:
+            bias += mod(xi::Mod::INT) * 50 + mod(xi::Mod::MACC) * 25;
+            break;
+        case xi::Job::WAR:
+        case xi::Job::PLD:
+        case xi::Job::DRK:
+            bias += mod(xi::Mod::STR) * 50 + mod(xi::Mod::VIT) * 50 + mod(xi::Mod::DEF) * 6;
+            break;
+        default:
+            break;
+    }
+    return bias;
+}
+
+auto armourScore(const CItemEquipment* PItem, const xi::Job job) -> int32
+{
+    return PItem->getReqLvl() * 1000 + PItem->getModifier(xi::Mod::DEF) * 10 + PItem->getModifier(xi::Mod::HP) + PItem->getModifier(xi::Mod::MP) + jobBias(PItem, job);
 }
 
 // Every piece of equipment, gathered once rather than scanning every item id at each level-up.
@@ -198,7 +234,7 @@ auto planGear(const xi::Job job, const uint8 level, const uint8 race) -> std::ar
                 continue;
             }
 
-            const auto score = static_cast<int32>(PWeapon->getDamage() * 100000 / PWeapon->getDelay());
+            const auto score = static_cast<int32>(PWeapon->getDamage() * 100000 / PWeapon->getDelay()) + jobBias(PWeapon, job);
             if (rank < bestSkill || (rank == bestSkill && score > bestWeapon))
             {
                 bestSkill          = rank;
@@ -224,7 +260,7 @@ auto planGear(const xi::Job job, const uint8 level, const uint8 race) -> std::ar
             }
 
             const auto rank = static_cast<std::size_t>(std::ranges::find(ranged, PWeapon->getSkillType()) - ranged.begin());
-            const auto score = PWeapon->getDelay() > 0 ? static_cast<int32>(PWeapon->getDamage() * 100000 / PWeapon->getDelay()) : -1;
+            const auto score = PWeapon->getDelay() > 0 ? static_cast<int32>(PWeapon->getDamage() * 100000 / PWeapon->getDelay()) + jobBias(PWeapon, job) : -1;
             if (rank < ranged.size() && score >= 0 && (rank < bestRangedSkill || (rank == bestRangedSkill && score > bestRanged)))
             {
                 bestRangedSkill   = rank;
@@ -246,9 +282,9 @@ auto planGear(const xi::Job job, const uint8 level, const uint8 race) -> std::ar
 
         if (slots & (1 << SLOT_SUB))
         {
-            if (PItem->IsShield() && armourScore(PItem) > best[SLOT_SUB])
+            if (PItem->IsShield() && armourScore(PItem, job) > best[SLOT_SUB])
             {
-                best[SLOT_SUB] = armourScore(PItem);
+                best[SLOT_SUB] = armourScore(PItem, job);
                 plan[SLOT_SUB] = id;
             }
             continue;
@@ -256,21 +292,21 @@ auto planGear(const xi::Job job, const uint8 level, const uint8 race) -> std::ar
 
         if (slots & (1 << SLOT_RING1))
         {
-            rings.emplace_back(armourScore(PItem), id);
+            rings.emplace_back(armourScore(PItem, job), id);
             continue;
         }
 
         if (slots & (1 << SLOT_EAR1))
         {
-            earrings.emplace_back(armourScore(PItem), id);
+            earrings.emplace_back(armourScore(PItem, job), id);
             continue;
         }
 
         for (const auto slot : { SLOT_HEAD, SLOT_BODY, SLOT_HANDS, SLOT_LEGS, SLOT_FEET, SLOT_NECK, SLOT_WAIST, SLOT_BACK })
         {
-            if ((slots & (1 << slot)) && armourScore(PItem) > best[slot])
+            if ((slots & (1 << slot)) && armourScore(PItem, job) > best[slot])
             {
-                best[slot] = armourScore(PItem);
+                best[slot] = armourScore(PItem, job);
                 plan[slot] = id;
             }
         }

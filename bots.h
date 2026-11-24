@@ -271,6 +271,8 @@ auto isPoolChar(uint32 charId) -> bool;
 void loadDiary(Bot& bot);                  // the column loadPool read, onto this bot
 void noteEvent(Bot& bot, std::string fact); // one short line, newest last, saved to bot_pool.diary
 auto recentEvents(const Bot& bot) -> std::string; // newest 2-3 lines for the prompt; empty when there are none
+void noteLastSeen(const Bot& bot);                // unix seconds into bot_pool.last_seen
+auto catchUp(Bot& bot) -> uint8;                  // levels gained while away; 0 when none were granted
 
 // bot_ai.cpp
 void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, bool active, timer::time_point tick);

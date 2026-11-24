@@ -970,6 +970,19 @@ class BotModule : public CPPModule
             return;
         }
 
+        // After enterZone's prepare, never inside LoadChar. A gain re-gears for the new level.
+        if (bots::catchUp(bot) > 0)
+        {
+            if (const auto pooled = std::ranges::find(pool_, bot.charId, &bots::PoolEntry::charId); pooled != pool_.end())
+            {
+                if (auto* PChar = bot.entity())
+                {
+                    pooled->level = PChar->GetMLevel();
+                }
+            }
+            bots::prepare(bot, lua);
+        }
+
         if (const auto minutes = sessionMinutes())
         {
             bot.sessionEnds = timer::now() + std::chrono::minutes(*minutes);
@@ -1076,6 +1089,7 @@ class BotModule : public CPPModule
             charutils::removeCharFromZone(PChar);
         }
 
+        bots::noteLastSeen(bot);
         db::preparedStmt("DELETE FROM accounts_sessions WHERE charid = ?", bot.charId);
         bot.session->PChar.reset();
 

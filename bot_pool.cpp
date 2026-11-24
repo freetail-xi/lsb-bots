@@ -6,7 +6,13 @@
 
 #include "common/database.h"
 #include "common/logging.h"
+#include "common/settings.h"
+#include "common/xirand.h"
 
+#include "map/entities/char_entity.h"
+#include "map/utils/charutils.h"
+
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -184,6 +190,8 @@ void ensureSchema()
                      "personality text NULL, "
                      "chattiness tinyint(3) unsigned NULL, "
                      "diary text NULL, "
+                     "last_seen int(10) unsigned NULL, "
+                     "play_style tinyint(3) unsigned NULL, "
                      "PRIMARY KEY (name)"
                      ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci");
 
@@ -191,6 +199,8 @@ void ensureSchema()
     db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS chattiness tinyint(3) unsigned NULL AFTER personality");
     db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS subjob tinyint(2) unsigned NULL AFTER level");
     db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS diary text NULL AFTER chattiness");
+    db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS last_seen int(10) unsigned NULL AFTER diary");
+    db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS play_style tinyint(3) unsigned NULL AFTER last_seen");
 }
 
 namespace
@@ -428,6 +438,177 @@ auto recentEvents(const Bot& bot) -> std::string
         out += fmt::format("{}, {}", whenPhrase(bot.diary[i].at), bot.diary[i].text);
     }
     return out;
+}
+
+namespace
+{
+
+constexpr int64 kAwayMin   = 60 * 60;          // an hour, or the gap is not a catch-up
+constexpr int64 kAwayMax   = 3 * 24 * 60 * 60; // three days of time, and no more
+constexpr uint8 kLevelCap  = 75;
+// Levels per real day at level 20. Above 20 this shrinks by 20/level.
+constexpr std::array<double, 3> kPerDay = { 1.0, 2.0, 4.0 }; // casual, regular, hardcore
+
+constexpr std::array<const char*, 3> kStyleName = { "casual", "regular", "hardcore" };
+
+constexpr std::array<const char*, 23> kJobAbbrev = {
+    "",    "WAR", "MNK", "WHM", "BLM", "RDM", "THF", "PLD", "DRK", "BST", "BRD", "RNG",
+    "SAM", "NIN", "DRG", "SMN", "BLU", "COR", "PUP", "DNC", "SCH", "GEO", "RUN",
+};
+
+auto unixNow() -> uint32
+{
+    return static_cast<uint32>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+// Levels per day at this level: the level-20 pace, and fewer once the level is past 20.
+auto levelsPerDay(const uint8 style, const uint8 level) -> double
+{
+    const auto base = style < kPerDay.size() ? kPerDay[style] : kPerDay[1];
+    return base * 20.0 / static_cast<double>(std::max<uint8>(level, 20));
+}
+
+auto storeLastSeen(const Bot& bot, const uint32 now) -> bool
+{
+    if (!db::preparedStmt("UPDATE bot_pool SET last_seen = ? WHERE charid = ?", now, bot.charId))
+    {
+        ShowErrorFmt("bots: could not store {}'s last seen time", bot.name);
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+void noteLastSeen(const Bot& bot)
+{
+    storeLastSeen(bot, unixNow());
+}
+
+// One grant per login. last_seen is written after the exp, so a retry cannot grant it again.
+// A NULL last_seen has never logged out and grants nothing.
+auto catchUp(Bot& bot) -> uint8
+{
+    if (!settings::get<bool>("bots.CATCH_UP"))
+    {
+        return 0;
+    }
+
+    auto* PChar = bot.entity();
+    if (PChar == nullptr || PChar->loc.zone == nullptr)
+    {
+        return 0;
+    }
+
+    const auto rset = db::preparedStmt("SELECT last_seen, play_style FROM bot_pool WHERE charid = ?", bot.charId);
+    if (!rset || !rset->next() || rset->isNull("last_seen"))
+    {
+        return 0;
+    }
+
+    const auto now  = unixNow();
+    const auto seen = rset->get<uint32>("last_seen");
+    if (now < seen)
+    {
+        return 0;
+    }
+    const auto gap = static_cast<int64>(now) - static_cast<int64>(seen);
+    if (gap < kAwayMin)
+    {
+        return 0;
+    }
+
+    // Rolled once. A later login reads the stored value.
+    uint8 style = 1;
+    if (rset->isNull("play_style"))
+    {
+        style = xirand::GetRandomNumber<uint8>(3);
+        if (!db::preparedStmt("UPDATE bot_pool SET play_style = ? WHERE charid = ? AND play_style IS NULL", style, bot.charId))
+        {
+            ShowErrorFmt("bots: could not store {}'s play style", bot.name);
+        }
+    }
+    else
+    {
+        style = rset->get<uint8>("play_style");
+    }
+
+    const auto before = PChar->GetMLevel();
+    const auto capped = std::min(gap, kAwayMax);
+    uint32     owed   = 0;
+    if (before < kLevelCap)
+    {
+        const auto bar = charutils::GetExpNEXTLevel(before);
+        if (bar == 0)
+        {
+            ShowErrorFmt("bots: no exp to the next level for {} at {}, skipping catch-up", bot.name, before);
+            return 0;
+        }
+
+        auto   level     = before;
+        double hoursLeft = static_cast<double>(capped) / 3600.0;
+        while (hoursLeft > 1e-6 && level < kLevelCap)
+        {
+            const auto tnl    = charutils::GetExpNEXTLevel(level);
+            const auto perDay = levelsPerDay(style, level);
+            if (tnl == 0 || perDay <= 0.0)
+            {
+                break;
+            }
+            const auto hoursPerLevel = 24.0 / perDay;
+            const auto take          = std::min(hoursLeft, hoursPerLevel);
+            if (take + 1e-4 >= hoursPerLevel)
+            {
+                owed += tnl;
+                ++level;
+            }
+            else
+            {
+                owed += static_cast<uint32>(static_cast<double>(tnl) * (take / hoursPerLevel));
+            }
+            hoursLeft -= take;
+        }
+    }
+
+    uint32 spent = 0;
+    // AddExperiencePoints applies at most one level per call and drops exp past the next bar, so one call per level.
+    for (uint8 step = 0; owed > 0 && PChar->GetMLevel() < kLevelCap && step < kLevelCap; ++step)
+    {
+        const auto tnl = charutils::GetExpNEXTLevel(PChar->GetMLevel());
+        if (tnl == 0)
+        {
+            break;
+        }
+        const auto grant  = std::min(owed, tnl);
+        const auto level  = PChar->GetMLevel();
+        // fromScripts skips map.EXP_RATE. awardRegionPoints is off: this is not a kill.
+        // A dead bot still has to take the exp; the raise flag is what lets a corpse receive it.
+        charutils::AddExperiencePoints(PChar->isDead(), false, true, PChar, PChar, grant);
+        owed -= grant;
+        spent += grant;
+        if (PChar->GetMLevel() == level)
+        {
+            break;
+        }
+    }
+
+    // Stamp before the diary write, so a failure there cannot grant this gap twice.
+    storeLastSeen(bot, now);
+
+    const auto after  = PChar->GetMLevel();
+    const auto gained = after > before ? static_cast<uint8>(after - before) : 0;
+    ShowInfoFmt("bots: {} was away {:.1f} hours ({}), catch-up {} exp, now level {}", bot.name, static_cast<double>(capped) / 3600.0,
+                style < kStyleName.size() ? kStyleName[style] : kStyleName[1], spent, after);
+
+    if (gained > 0)
+    {
+        const auto id   = static_cast<std::size_t>(PChar->GetMJob());
+        const auto abbr = id < kJobAbbrev.size() && kJobAbbrev[id][0] != '\0' ? kJobAbbrev[id] : "?";
+        noteEvent(bot, fmt::format("gained {} level{} while away, now {} {}", gained, gained == 1 ? "" : "s", abbr, after));
+        // The prepare that follows would otherwise also diary "reached level".
+        bot.preparedLevel = after;
+    }
+    return gained;
 }
 
 } // namespace bots
