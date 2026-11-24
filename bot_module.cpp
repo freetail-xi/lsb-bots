@@ -652,6 +652,19 @@ class BotModule : public CPPModule
             }
             if (group.size() < 2)
             {
+                // Test server 2026-11-23: three low bots in a town zone never grouped. Say why (closest pair).
+                float closest = std::numeric_limits<float>::max();
+                for (std::size_t i = 0; i < bots.size(); ++i)
+                {
+                    for (std::size_t j = i + 1; j < bots.size(); ++j)
+                    {
+                        if (bots[i]->entity() != nullptr && bots[j]->entity() != nullptr)
+                        {
+                            closest = std::min(closest, distance(bots[i]->entity()->loc.p, bots[j]->entity()->loc.p));
+                        }
+                    }
+                }
+                ShowInfoFmt("bots: no party in zone {}: {} unpartied, closest pair {:.0f} yalms", zone, bots.size(), closest);
                 continue;
             }
 
