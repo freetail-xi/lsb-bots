@@ -907,6 +907,28 @@ void breakCamp(CBattleEntity* PLeader)
     choices.erase(PLeader->id);
 }
 
+// The party is standing in some other zone than the one this pull was made for. Left in place, hasPull stays
+// true and a town party never looks for a camp to head to.
+void dropCampIfLeft(CCharEntity* PChar)
+{
+    if (PChar == nullptr || PChar->PParty == nullptr)
+    {
+        return;
+    }
+    auto* PLeader = PChar->PParty->GetLeader();
+    if (PLeader == nullptr || PLeader->loc.zone == nullptr)
+    {
+        return;
+    }
+    const auto it = pulls.find(PLeader->id);
+    if (it == pulls.end() || it->second.zone == PLeader->getZone())
+    {
+        return;
+    }
+    pulls.erase(it);
+    choices.erase(PLeader->id);
+}
+
 auto pullerOf(const CCharEntity* PChar) -> uint32
 {
     const auto* pull = pullFor(PChar);

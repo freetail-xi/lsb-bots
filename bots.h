@@ -379,6 +379,7 @@ void setPuller(CBattleEntity* PLeader, uint32 pullerId);
 void stopPulling(CBattleEntity* PLeader);
 void setCamp(CBattleEntity* PLeader);
 void breakCamp(CBattleEntity* PLeader);
+void dropCampIfLeft(CCharEntity* PChar); // a pull for a zone this leader has left, so a town party can head out
 auto campSpot(const CCharEntity* PChar) -> std::optional<position_t>;
 auto campPlace(const CCharEntity* PChar) -> std::optional<Place>; // copy of the Pull camp; empty when the party has none
 auto beingPulled(const CCharEntity* PChar, const CBattleEntity* PMob) -> bool;
@@ -399,6 +400,7 @@ auto act(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, bool travellin
 auto followOrder(Bot& bot, PacketSystem& packets, timer::time_point tick) -> bool;
 
 void travel(CCharEntity* PChar, xi::ZoneId zone, const position_t& pos);
+void dropOuting(uint32 charId); // the head-out stored under this leader; cleared when they log out
 
 // bot_move.cpp
 auto makePathFind(CCharEntity* PChar) -> std::unique_ptr<CPathFind>;

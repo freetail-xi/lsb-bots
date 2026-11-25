@@ -276,6 +276,14 @@ auto zoneText(const xi::ZoneId zone) -> std::string
     return fmt::format("{}", static_cast<uint16>(zone));
 }
 
+// A cutscene, or a gather trade that has not opened one yet. Destroying the character here, or zoning it,
+// leaves the event (or the trade that is about to open one) pointing at a character that is gone.
+auto inCutscene(const bots::Bot& bot) -> bool
+{
+    const auto* PChar = bot.entity();
+    return PChar != nullptr && (PChar->isInEvent() || (bot.gather && bot.gather->waiting));
+}
+
 } // namespace
 
 class BotModule : public CPPModule
@@ -453,11 +461,11 @@ class BotModule : public CPPModule
             auto it = online_.rend();
             if (target != 0)
             {
-                it = std::ranges::find_if(online_.rbegin(), online_.rend(), [&](const bots::Bot& bot) { return drop(bot) && !bot.citizen; });
+                it = std::ranges::find_if(online_.rbegin(), online_.rend(), [&](const bots::Bot& bot) { return drop(bot) && !bot.citizen && !inCutscene(bot); });
             }
             if (it == online_.rend())
             {
-                it = std::ranges::find_if(online_.rbegin(), online_.rend(), drop);
+                it = std::ranges::find_if(online_.rbegin(), online_.rend(), [&](const bots::Bot& bot) { return drop(bot) && !inCutscene(bot); });
             }
             if (it != online_.rend())
             {
@@ -518,7 +526,7 @@ class BotModule : public CPPModule
             {
                 if (!enterZone(bot))
                 {
-                    logout(bot);
+                    logout(bot, true);
                 }
             }
             else if (auto* PChar = bot.entity(); PChar != nullptr)
@@ -1034,7 +1042,7 @@ class BotModule : public CPPModule
             for (auto& bot : online_)
             {
                 auto* PChar = bot.entity();
-                if (isFree(bot) && !bot.citizen && !leveling(PChar->GetMLevel()) && PChar->loc.zone != nullptr && PChar->status == xi::Status::Normal && !zones.contains(PChar->getZone()) &&
+                if (isFree(bot) && !bot.citizen && !inCutscene(bot) && !leveling(PChar->GetMLevel()) && PChar->loc.zone != nullptr && PChar->status == xi::Status::Normal && !zones.contains(PChar->getZone()) &&
                     (best == nullptr || gap(PChar->GetMLevel()) < gap(best->entity()->GetMLevel())))
                 {
                     best = &bot;
@@ -1177,9 +1185,16 @@ class BotModule : public CPPModule
     }
 
     // Mirrors the session cleanup a timed-out client gets.
-    void logout(bots::Bot& bot)
+    // force is the failed zone-in path: the character never finished arriving, so it cannot wait out a cutscene.
+    void logout(bots::Bot& bot, const bool force = false)
     {
-        if (auto* PChar = bot.entity(); PChar != nullptr && PChar->loc.zone != nullptr)
+        auto* PChar = bot.entity();
+        if (!force && inCutscene(bot))
+        {
+            return;
+        }
+
+        if (PChar != nullptr && PChar->loc.zone != nullptr)
         {
             // Bots level in parties; the next placement goes by the new level.
             if (const auto entry = std::ranges::find(pool_, bot.charId, &bots::PoolEntry::charId); entry != pool_.end())
@@ -1198,6 +1213,12 @@ class BotModule : public CPPModule
             PChar->status = xi::Status::Shutdown;
             charutils::removeCharFromZone(PChar);
         }
+
+        if (PChar != nullptr)
+        {
+            bots::breakCamp(PChar);
+        }
+        bots::dropOuting(bot.charId);
 
         bots::noteLastSeen(bot);
         db::preparedStmt("DELETE FROM accounts_sessions WHERE charid = ?", bot.charId);
@@ -1235,7 +1256,7 @@ class BotModule : public CPPModule
         {
             return false;
         }
-        if (PChar->isDead() || PChar->PAI->IsEngaged() || PChar->isInEvent())
+        if (PChar->PAI == nullptr || PChar->isDead() || PChar->PAI->IsEngaged() || inCutscene(bot))
         {
             return false;
         }
@@ -1276,7 +1297,7 @@ class BotModule : public CPPModule
         std::vector<bots::Bot*> free;
         for (auto& bot : online_)
         {
-            if (isFree(bot) && !bot.citizen)
+            if (isFree(bot) && !bot.citizen && !inCutscene(bot))
             {
                 free.push_back(&bot);
             }
