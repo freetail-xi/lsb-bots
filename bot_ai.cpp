@@ -201,6 +201,23 @@ void setResting(Bot& bot, PacketSystem& packets, const bool resting)
         }
     }
 
+    // The server checks the animation, but bots decide by the Healing effect, and the two can disagree (the effect
+    // outlives the sit animation). "Off" while not in the Healing animation is refused, every tick, so the bot stays
+    // stuck resting: drop the effect the way the server's own "Off" does. "On" while already healing is refused too.
+    if (auto* PChar = bot.entity(); PChar != nullptr && PChar->StatusEffectContainer != nullptr)
+    {
+        const bool animHealing = PChar->animation == xi::Animation::Healing;
+        if (!resting && !animHealing)
+        {
+            PChar->StatusEffectContainer->DelStatusEffectSilent(xi::StatusEffect::Healing);
+            return;
+        }
+        if (resting && animHealing)
+        {
+            return;
+        }
+    }
+
     auto packet                                = makePacket<GP_CLI_COMMAND_CAMP>();
     packet->as<GP_CLI_COMMAND_CAMP>()->Mode    = static_cast<uint32_t>(resting ? GP_CLI_COMMAND_CAMP_MODE::On : GP_CLI_COMMAND_CAMP_MODE::Off);
     send(bot, packets, *packet);
