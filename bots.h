@@ -90,6 +90,7 @@ enum class OrderKind : uint8
     Camp,     // camp is where the leader stands now
     Assist,   // fight whatever the subject fights, from now on
     Ability,  // a job ability once: on the speaker's monster or on itself
+    HeadOut,  // a real player told the party to leave for a camp
 };
 
 struct Order
@@ -247,8 +248,26 @@ struct Bot
     std::deque<DiaryLine>       diary;           // oldest first, capped at 8; the bot_pool.diary column
     std::optional<Gather>       gather;          // a HELM trip; empty when not gathering
     timer::time_point           nextGather{};    // no new trip before this
+    xi::ZoneId                  joinedFrom{};    // zone it accepted a party invite in, for the join log
+    uint32                      notedParty{};    // party id already logged as a join; 0 when it has no party
 
     auto entity() const -> CCharEntity*;
+};
+
+// A bot party filling to six, then the camp it left for. Keyed by the leader's character id.
+// The band is centred on `center` (the leader's level when recruiting started).
+struct PartyRecruit
+{
+    uint32            leaderId{};
+    uint32            partyId{};
+    uint8             center{};
+    uint8             campAvg{}; // average level when the camp was picked; 0 until then
+    xi::ZoneId        zone{};
+    position_t        spot{};
+    bool              atCamp{};
+    bool              depart{}; // a player said to leave, or the average has outgrown the camp
+    timer::time_point since{};
+    timer::time_point nextInvite{};
 };
 
 // Medicines every bot carries, restocked like ammunition.
@@ -309,6 +328,7 @@ auto catchUp(Bot& bot) -> uint8;                  // levels gained while away; 0
 void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, bool active, timer::time_point tick);
 void send(Bot& bot, PacketSystem& packets, CBasicPacket& packet);
 void leaveParty(Bot& bot, PacketSystem& packets);
+void disbandParty(Bot& bot, PacketSystem& packets); // leader breaks the party up; anyone else just leaves
 auto inspect(const Bot& bot) -> std::vector<std::string>;
 void castSpell(Bot& bot, PacketSystem& packets, SpellID spellId, const CBaseEntity* PTarget);
 void useAbility(Bot& bot, PacketSystem& packets, uint16 abilityId, const CBaseEntity* PTarget);
@@ -381,6 +401,7 @@ void setCamp(CBattleEntity* PLeader);
 void breakCamp(CBattleEntity* PLeader);
 void dropCampIfLeft(CCharEntity* PChar); // a pull for a zone this leader has left, so a town party can head out
 auto campSpot(const CCharEntity* PChar) -> std::optional<position_t>;
+auto campBlocked(xi::ZoneId zone, const position_t& pos, uint32 exceptLeader) -> bool; // another party's camp is on this spot
 auto campPlace(const CCharEntity* PChar) -> std::optional<Place>; // copy of the Pull camp; empty when the party has none
 auto beingPulled(const CCharEntity* PChar, const CBattleEntity* PMob) -> bool;
 auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLeader, timer::time_point tick) -> bool;
@@ -401,6 +422,21 @@ auto followOrder(Bot& bot, PacketSystem& packets, timer::time_point tick) -> boo
 
 void travel(CCharEntity* PChar, xi::ZoneId zone, const position_t& pos);
 void dropOuting(uint32 charId); // the head-out stored under this leader; cleared when they log out
+
+// Party level band. LEVEL_WINDOW is logins and balance only; invites use this.
+auto partySpread() -> int;
+auto fitsBand(int center, int lo, int hi, int level) -> bool; // lo > hi when there is no other member yet
+
+// Recruiting a party up to six. The map lives for the process; logout drops that leader's row.
+void beginRecruit(CCharEntity* PLeader, timer::time_point now);
+void endRecruit(uint32 leaderId, timer::time_point now); // disband: the leader waits before starting another
+void dropRecruit(uint32 charId);                         // logout, no cooldown
+auto leaderCooling(uint32 charId, timer::time_point now) -> bool;
+auto recruitLeaderIds() -> std::vector<uint32>;
+auto recruitByLeader(uint32 leaderId) -> PartyRecruit*;
+auto recruitFor(const CCharEntity* PChar) -> PartyRecruit*; // this leader, or the party's, retargeted when the lead moves
+void recruitInvited(uint32 leaderId, timer::time_point now);
+void askHeadOut(CCharEntity* PMember); // a real player's "head out": leave for a camp even under six
 
 // bot_move.cpp
 auto makePathFind(CCharEntity* PChar) -> std::unique_ptr<CPathFind>;
@@ -438,6 +474,7 @@ struct OrderPlan
     bool                 quiet{}; // one of several bots given the same job: only the first answers
 };
 auto planOrder(const std::string& text, CCharEntity* PSpeaker, const std::vector<Bot*>& bots) -> std::vector<OrderPlan>;
+auto isHeadOutLine(const std::string& text) -> bool; // "head out", "ready", and the other leave-for-camp phrases
 auto orderSubject(const std::string& text, OrderKind kind, CCharEntity* PSpeaker) -> CBattleEntity*;
 auto pullerRank(xi::Job job, uint8 level) -> int;
 
@@ -457,6 +494,8 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
 void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, timer::time_point tick);
 void deliverChat(std::vector<Bot>& online, PacketSystem& packets);
 void callout(const Bot& bot, const std::string& text, bool macro);
+void partySay(const Bot& bot, const std::string& text); // a fixed party line, bot party or not; other bots don't answer it
+auto lfmLine(const CCharEntity* PChar, uint8 center) -> std::string; // "LFM 18-24, need WHM + 2 DD"
 void tell(const Bot& bot, const std::string& to, const std::string& text);
 auto sayCanned(const Bot& bot, const std::string& text) -> bool; // a fixed /say, logged by say()
 void refuseInvites(uint32 charId);       // a tell of "no invites": not asked again until the server restarts

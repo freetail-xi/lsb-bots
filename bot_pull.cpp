@@ -1257,6 +1257,23 @@ auto campPlace(const CCharEntity* PChar) -> std::optional<Place>
     return Place{ pull->zone, pull->camp };
 }
 
+// Another leader's camp is this spot. Same zone, within the distance a party holds. The party's own camp is not in the way.
+auto campBlocked(const xi::ZoneId zone, const position_t& pos, const uint32 exceptLeader) -> bool
+{
+    for (const auto& [id, pull] : pulls)
+    {
+        if (id == exceptLeader || pull.zone != zone)
+        {
+            continue;
+        }
+        if (distance(pull.camp, pos) < 40.0f)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Where this bot's party is camped, while the leader is still there; not in towns.
 auto campSpot(const CCharEntity* PChar) -> std::optional<position_t>
 {

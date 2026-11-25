@@ -174,6 +174,11 @@ auto parse(const std::string& text) -> std::optional<Request>
     {
         return Request{ OrderKind::Stay, {}, false, "stay where you are" };
     }
+    // Before "let's go": "lets go camp" contains that phrase, and that one is a camp, not a follow.
+    if (isHeadOutLine(t))
+    {
+        return Request{ OrderKind::HeadOut, {}, false, "head out to a camp" };
+    }
     if (saysAny(t, { "follow", "follow me", "come here", "lets go", "let's go", "come on" }))
     {
         return Request{ OrderKind::Follow, {}, false, "follow" };
@@ -274,6 +279,26 @@ auto preference(const Job job, const uint8 level, const OrderKind kind) -> int
 
 } // namespace
 
+// A real player telling the party to leave for a camp. "let's go" stays Follow.
+auto isHeadOutLine(const std::string& text) -> bool
+{
+    const auto t = lowered(text);
+    if (saysAny(t, { "head out", "lets head out", "let's head out", "go to camp", "lets go camp", "let's go camp" }))
+    {
+        return true;
+    }
+    // "ready" only as the whole line ("ready", "I'm ready!"), so "not ready yet" doesn't send the party.
+    std::string letters;
+    for (const char c : t)
+    {
+        if (std::isalpha(static_cast<unsigned char>(c)))
+        {
+            letters += c;
+        }
+    }
+    return letters == "ready" || letters == "imready" || letters == "wereready" || letters == "readytogo";
+}
+
 // "follow Ysolde", "assist Kakaru": the party member named after the keyword, else the speaker.
 auto orderSubject(const std::string& text, const OrderKind kind, CCharEntity* PSpeaker) -> CBattleEntity*
 {
@@ -309,6 +334,11 @@ auto planOrder(const std::string& text, CCharEntity* PSpeaker, const std::vector
 {
     const auto request = parse(text);
     if (!request || PSpeaker == nullptr || PSpeaker->PParty == nullptr)
+    {
+        return {};
+    }
+    // Bots say "ready" to each other. Only a real player sends the party to a camp.
+    if (request->kind == OrderKind::HeadOut && isPoolChar(PSpeaker->id))
     {
         return {};
     }
@@ -378,6 +408,23 @@ auto planOrder(const std::string& text, CCharEntity* PSpeaker, const std::vector
     };
 
     std::vector<OrderPlan> plans;
+
+    // One bot carries it out: the leader when they are a bot, else whoever heard it. The flag sits on the party.
+    if (request->kind == OrderKind::HeadOut)
+    {
+        Bot* who = party.front();
+        for (auto* bot : party)
+        {
+            auto* PChar = bot->entity();
+            if (PChar != nullptr && PChar->PParty != nullptr && PChar->PParty->GetLeader() == PChar)
+            {
+                who = bot;
+                break;
+            }
+        }
+        plans.push_back(OrderPlan{ who, order(who), "You were just asked to head out to a camp and the party is going." });
+        return plans;
+    }
 
     // Party-wide requests go to everyone asked.
     if (request->kind == OrderKind::Attack || request->kind == OrderKind::Stop || request->kind == OrderKind::Rest ||

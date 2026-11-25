@@ -128,6 +128,10 @@ void sendAction(Bot& bot, PacketSystem& packets, const GP_CLI_COMMAND_ACTION_ACT
 
 void acceptInvite(Bot& bot, PacketSystem& packets)
 {
+    if (auto* PChar = bot.entity(); PChar != nullptr && PChar->loc.zone != nullptr)
+    {
+        bot.joinedFrom = PChar->getZone();
+    }
     auto packet                                         = makePacket<GP_CLI_COMMAND_GROUP_SOLICIT_RES>();
     packet->as<GP_CLI_COMMAND_GROUP_SOLICIT_RES>()->Res = static_cast<uint8_t>(GP_CLI_COMMAND_GROUP_SOLICIT_RES_RES::Accept);
     send(bot, packets, *packet);
@@ -945,30 +949,11 @@ struct Outing
     timer::time_point until{};
 };
 
-std::map<uint32, Outing> outings;
-
-auto highestLevel(const CCharEntity* PChar) -> int
-{
-    int highest = 1;
-    for (const auto* PMember : PChar->PParty->members)
-    {
-        highest = std::max(highest, static_cast<int>(PMember->GetMLevel()));
-    }
-    return highest;
-}
-
-// Same zones autoCamp refuses: not an outdoor field or a dungeon, or a city.
-auto notHunting(const CCharEntity* PChar) -> bool
-{
-    if (PChar->loc.zone == nullptr)
-    {
-        return false;
-    }
-    const auto type    = static_cast<uint16>(PChar->loc.zone->GetTypeMask());
-    const bool hunting = (type & (static_cast<uint16>(xi::ZoneType::Outdoors) | static_cast<uint16>(xi::ZoneType::Dungeon))) != 0 &&
-                         (type & static_cast<uint16>(xi::ZoneType::City)) == 0;
-    return !hunting;
-}
+std::map<uint32, Outing>       outings;
+std::set<uint32>               departSoon; // a player said to head out and this leader has no recruit row yet
+std::set<uint32>               bandLeft;   // leave packet already sent; the party list has not dropped them yet
+std::map<uint32, PartyRecruit> recruits;
+std::map<uint32, timer::time_point> leadCooldown;
 
 void endHeadOut(Bot& bot, CCharEntity* PChar)
 {
@@ -986,12 +971,22 @@ void endHeadOut(Bot& bot, CCharEntity* PChar)
     }
     outings.erase(PChar->id);
     bot.headingOut = false;
+    // Arrived in the zone the camp was picked in. Further recruits travel here, and the party keeps fighting.
+    if (PChar->PParty != nullptr && PChar->PParty->GetLeader() == PChar && PChar->loc.zone != nullptr)
+    {
+        if (auto* rec = recruitFor(PChar); rec != nullptr && rec->campAvg > 0 && PChar->getZone() == rec->zone)
+        {
+            rec->atCamp = true;
+            rec->spot   = PChar->loc.p;
+        }
+    }
 }
 
 // A member of a party already walking out copies the leader's camp onto the return path.
-void joinOuting(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, const timer::time_point tick)
+void joinOuting(Bot& bot, CCharEntity* PChar, const std::set<uint32>& /*botIds*/, const timer::time_point tick)
 {
-    if (bot.returnUntil != timer::time_point{} || bot.nextHeadOut > tick || !partyIsBots(bot, PChar, botIds))
+    // A real player in the party still walks out with it: they said so, or the party filled to six.
+    if (bot.returnUntil != timer::time_point{} || bot.nextHeadOut > tick || PChar->PParty == nullptr)
     {
         return;
     }
@@ -1015,37 +1010,227 @@ void joinOuting(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, co
     bot.headingOut  = true;
 }
 
-// Leader of a bot-only party standing where autoCamp will not hunt: pick a camp and walk there. At most once per 5 minutes.
-void startHeadOut(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, const timer::time_point tick)
+auto averageLevel(const CCharEntity* PChar) -> int
 {
-    if (PChar->PParty == nullptr || PChar->PParty->GetLeader() != PChar || bot.returnUntil != timer::time_point{} || tick < bot.nextHeadOut ||
-        !partyIsBots(bot, PChar, botIds) || !notHunting(PChar))
+    if (PChar->PParty == nullptr || PChar->PParty->members.empty())
+    {
+        return static_cast<int>(PChar->GetMLevel());
+    }
+    int sum = 0;
+    for (const auto* PMember : PChar->PParty->members)
+    {
+        sum += static_cast<int>(PMember->GetMLevel());
+    }
+    const auto count = static_cast<int>(PChar->PParty->members.size());
+    return (sum + count / 2) / count;
+}
+
+auto partyBusy(const CCharEntity* PChar) -> bool
+{
+    return PChar->PParty != nullptr && std::ranges::any_of(PChar->PParty->members, [](const CBattleEntity* PMember)
+                                                           {
+                                                               return PMember->isDead() || (PMember->PAI != nullptr && PMember->PAI->IsEngaged());
+                                                           });
+}
+
+// Cities, and the field zones a party standing in one would reach first. Retail zone ids, the ones LSB uses.
+// There is no distance between zones in this module, so "nearest" is: this zone, then this list, then any open camp.
+auto neighborZones(const xi::ZoneId here) -> std::vector<xi::ZoneId>
+{
+    struct Row
+    {
+        uint16 zone;
+        uint16 near[4];
+    };
+    static constexpr Row rows[] = {
+        { 230, { 100, 101, 102, 140 } }, { 231, { 100, 101, 102, 140 } }, { 232, { 100, 101, 102, 140 } }, { 233, { 100, 101, 102, 140 } },
+        { 234, { 106, 107, 108, 172 } }, { 235, { 106, 107, 108, 172 } }, { 236, { 106, 107, 108, 109 } }, { 237, { 106, 107, 108, 172 } },
+        { 238, { 115, 116, 117, 145 } }, { 239, { 115, 116, 117, 192 } }, { 240, { 115, 116, 117, 118 } }, { 241, { 115, 116, 117, 145 } },
+        { 242, { 115, 116, 117, 192 } }, { 243, { 105, 110, 120, 119 } }, { 244, { 105, 110, 120, 119 } }, { 245, { 110, 105, 120, 119 } },
+        { 246, { 120, 110, 105, 119 } },
+    };
+    std::vector<xi::ZoneId> zones;
+    const auto id = static_cast<uint16>(here);
+    for (const auto& row : rows)
+    {
+        if (row.zone == id)
+        {
+            for (const auto zoneId : row.near)
+            {
+                zones.push_back(static_cast<xi::ZoneId>(zoneId));
+            }
+            break;
+        }
+    }
+    return zones;
+}
+
+// Average level, mobs from findCamps at that level. Skip a spot another party is already camped on. Prefer this zone, then a neighbor.
+auto pickPartyCamp(CCharEntity* PLeader, const uint8 level) -> std::optional<Place>
+{
+    std::vector<Place> open;
+    for (const auto& camp : findCamps(level))
+    {
+        if (!campBlocked(camp.zone, camp.pos, PLeader->id))
+        {
+            open.push_back(camp);
+        }
+    }
+    if (open.empty())
+    {
+        return std::nullopt;
+    }
+
+    const auto inZone = [&](const xi::ZoneId zone) -> std::optional<Place>
+    {
+        std::vector<Place> spots;
+        for (const auto& camp : open)
+        {
+            if (camp.zone == zone)
+            {
+                spots.push_back(camp);
+            }
+        }
+        if (spots.empty())
+        {
+            return std::nullopt;
+        }
+        if (PLeader->loc.zone != nullptr && PLeader->getZone() == zone)
+        {
+            const Place* best = &spots.front();
+            auto          dist = distance(PLeader->loc.p, best->pos);
+            for (const auto& camp : spots)
+            {
+                if (const auto away = distance(PLeader->loc.p, camp.pos); away < dist)
+                {
+                    best = &camp;
+                    dist = away;
+                }
+            }
+            return *best;
+        }
+        return spots[xirand::GetRandomNumber<std::size_t>(spots.size())];
+    };
+
+    if (PLeader->loc.zone != nullptr)
+    {
+        if (auto here = inZone(PLeader->getZone()))
+        {
+            return here;
+        }
+        for (const auto zone : neighborZones(PLeader->getZone()))
+        {
+            if (auto camp = inZone(zone))
+            {
+                return camp;
+            }
+        }
+    }
+
+    std::map<xi::ZoneId, int> count;
+    for (const auto& camp : open)
+    {
+        count[camp.zone]++;
+    }
+    xi::ZoneId bestZone = open.front().zone;
+    int        bestN    = 0;
+    for (const auto& [zone, n] : count)
+    {
+        if (n > bestN)
+        {
+            bestN    = n;
+            bestZone = zone;
+        }
+    }
+    return inZone(bestZone);
+}
+
+// Full (6), or a real player said to go, or the camp is outgrown. Not merely because the party is standing in town.
+void startHeadOut(Bot& bot, CCharEntity* PChar, const std::set<uint32>& /*botIds*/, const timer::time_point tick)
+{
+    if (PChar->PParty == nullptr || PChar->PParty->GetLeader() != PChar || bot.returnUntil != timer::time_point{} || tick < bot.nextHeadOut)
     {
         return;
     }
-    // A pull left over from a zone this party has left (a wipe that ended in town) keeps hasPull true, and then
-    // this look never runs again. Drop only a pull for somewhere else; a camp in this zone stays.
+
+    auto* rec = recruitFor(PChar);
+    const bool full   = PChar->PParty->IsFull() || PChar->PParty->members.size() >= 6;
+    const bool depart = (rec != nullptr && rec->depart) || departSoon.contains(PChar->id);
+    if (!full && !depart)
+    {
+        return;
+    }
+    if (partyBusy(PChar))
+    {
+        return;
+    }
+    // Someone is still zoning to the party. Leaving now would pick the camp without them.
+    const bool apart = std::ranges::any_of(PChar->PParty->members, [&](const CBattleEntity* PMember)
+                                           {
+                                               if (PMember->objtype != TYPE_PC || !isPoolChar(PMember->id))
+                                               {
+                                                   return false;
+                                               }
+                                               if (PMember->loc.zone == nullptr || PMember->status == xi::Status::Disappear)
+                                               {
+                                                   return true;
+                                               }
+                                               return PChar->loc.zone != nullptr && PMember->getZone() != PChar->getZone();
+                                           });
+    if (apart)
+    {
+        return;
+    }
+
+    const bool recamp = rec != nullptr && rec->campAvg > 0 && rec->atCamp;
+    if (hasPull(PChar) && depart)
+    {
+        breakCamp(PChar);
+    }
+    // A pull for a zone this party has left keeps hasPull true. Drop that one before deciding to stay.
+    // A camp in this zone, and depart still false, is the party already where it should be.
     dropCampIfLeft(PChar);
     if (hasPull(PChar))
     {
         return;
     }
 
-    const int  level = highestLevel(PChar);
-    bot.nextHeadOut  = tick + kHeadOutWait;
-    const auto camps = findCamps(static_cast<uint8>(level));
-    if (camps.empty())
+    const int  average = averageLevel(PChar);
+    const auto level   = static_cast<uint8>(std::clamp(average, 1, 75));
+    bot.nextHeadOut    = tick + kHeadOutWait;
+    const auto camp    = pickPartyCamp(PChar, level);
+    if (!camp)
     {
-        ShowInfoFmt("bots: {}'s party has no camp to head to (level {})", PChar->getName(), level);
+        ShowInfoFmt("bots: {}'s party has no camp to head to (avg {})", PChar->getName(), average);
         return;
     }
 
-    const auto& camp   = camps[xirand::GetRandomNumber<std::size_t>(camps.size())];
-    bot.returnCamp     = camp;
+    bot.returnCamp     = *camp;
     bot.returnUntil    = tick + kReturnCap;
     bot.headingOut     = true;
-    outings[PChar->id] = Outing{ camp, bot.returnUntil };
-    ShowInfoFmt("bots: {}'s party heads out to {} (level {})", PChar->getName(), campZoneText(PChar, camp.zone), level);
+    outings[PChar->id] = Outing{ *camp, bot.returnUntil };
+    departSoon.erase(PChar->id);
+    if (rec != nullptr)
+    {
+        rec->campAvg = static_cast<uint8>(average);
+        rec->center  = static_cast<uint8>(std::clamp(average, 1, 75)); // replacements fit the party as it is now
+        rec->atCamp  = false;
+        rec->depart  = false;
+        rec->zone    = camp->zone;
+        rec->spot    = camp->pos;
+    }
+    if (recamp)
+    {
+        ShowInfoFmt("bots: {}'s party heads to a new camp in zone {} (avg {})", PChar->getName(), campZoneText(PChar, camp->zone), average);
+    }
+    else if (full)
+    {
+        ShowInfoFmt("bots: {}'s party is full, heading to camp in zone {} (avg {})", PChar->getName(), campZoneText(PChar, camp->zone), average);
+    }
+    else
+    {
+        ShowInfoFmt("bots: {}'s party heads to camp in zone {} (avg {})", PChar->getName(), campZoneText(PChar, camp->zone), average);
+    }
 }
 
 auto campsIn(const std::vector<Place>& camps, const xi::ZoneId zone) -> std::vector<Place>
@@ -1502,6 +1687,193 @@ void dropOuting(const uint32 charId)
     outings.erase(charId);
 }
 
+auto partySpread() -> int
+{
+    return static_cast<int>(settings::get<uint32>("bots.PARTY_LEVEL_SPREAD"));
+}
+
+// The whole party stays inside the window centred on the leader's level at the start, and no wider than twice the spread.
+auto fitsBand(const int center, const int lo, const int hi, const int level) -> bool
+{
+    const int spread = partySpread();
+    const int gap    = level > center ? level - center : center - level;
+    if (gap > spread)
+    {
+        return false;
+    }
+    if (lo > hi)
+    {
+        return true;
+    }
+    return std::max(hi, level) - std::min(lo, level) <= spread * 2;
+}
+
+void beginRecruit(CCharEntity* PLeader, const timer::time_point now)
+{
+    if (PLeader == nullptr || PLeader->loc.zone == nullptr)
+    {
+        return;
+    }
+    PartyRecruit rec;
+    rec.leaderId   = PLeader->id;
+    rec.partyId    = PLeader->PParty != nullptr ? PLeader->PParty->GetPartyID() : 0;
+    rec.center     = static_cast<uint8>(PLeader->GetMLevel());
+    rec.zone       = PLeader->getZone();
+    rec.spot       = PLeader->loc.p;
+    rec.since      = now;
+    rec.nextInvite = now;
+    recruits[PLeader->id] = rec;
+}
+
+void endRecruit(const uint32 leaderId, const timer::time_point now)
+{
+    recruits.erase(leaderId);
+    departSoon.erase(leaderId);
+    const auto minutes = settings::get<uint32>("bots.PARTY_RECRUIT_MINUTES");
+    leadCooldown[leaderId] = now + std::chrono::minutes(minutes == 0 ? 1 : minutes);
+}
+
+void dropRecruit(const uint32 charId)
+{
+    recruits.erase(charId);
+    departSoon.erase(charId);
+}
+
+auto leaderCooling(const uint32 charId, const timer::time_point now) -> bool
+{
+    const auto it = leadCooldown.find(charId);
+    if (it == leadCooldown.end())
+    {
+        return false;
+    }
+    if (now >= it->second)
+    {
+        leadCooldown.erase(it);
+        return false;
+    }
+    return true;
+}
+
+auto recruitLeaderIds() -> std::vector<uint32>
+{
+    std::vector<uint32> ids;
+    ids.reserve(recruits.size());
+    for (const auto& [id, rec] : recruits)
+    {
+        ids.push_back(id);
+    }
+    return ids;
+}
+
+auto recruitByLeader(const uint32 leaderId) -> PartyRecruit*
+{
+    const auto it = recruits.find(leaderId);
+    return it != recruits.end() ? &it->second : nullptr;
+}
+
+// The row is this character's when they are still the solo recruiter, or still in its party.
+// A leader who already left keeps the key until formParties moves it, and must not be handed the old party.
+auto attached(const CCharEntity* PChar, const PartyRecruit& rec) -> bool
+{
+    if (PChar->PParty == nullptr)
+    {
+        return rec.partyId == 0 && rec.leaderId == PChar->id;
+    }
+    if (rec.partyId != 0 && rec.partyId == PChar->PParty->GetPartyID())
+    {
+        return true;
+    }
+    const auto* PLeader = PChar->PParty->GetLeader();
+    return PLeader != nullptr && rec.leaderId == PLeader->id;
+}
+
+auto recruitFor(const CCharEntity* PChar) -> PartyRecruit*
+{
+    if (PChar == nullptr)
+    {
+        return nullptr;
+    }
+    if (auto it = recruits.find(PChar->id); it != recruits.end())
+    {
+        if (!attached(PChar, it->second))
+        {
+            if (PChar->PParty == nullptr)
+            {
+                return nullptr;
+            }
+        }
+        else
+        {
+            if (PChar->PParty != nullptr)
+            {
+                it->second.partyId = PChar->PParty->GetPartyID();
+            }
+            return &it->second;
+        }
+    }
+    if (PChar->PParty == nullptr)
+    {
+        return nullptr;
+    }
+
+    const auto partyId = PChar->PParty->GetPartyID();
+    auto*      PLeader = PChar->PParty->GetLeader();
+    for (auto it = recruits.begin(); it != recruits.end(); ++it)
+    {
+        const bool sameParty = it->second.partyId != 0 && it->second.partyId == partyId;
+        const bool sameLead  = PLeader != nullptr && it->first == PLeader->id;
+        if (!sameParty && !sameLead)
+        {
+            continue;
+        }
+        if (PLeader != nullptr && it->first != PLeader->id && PChar->id == PLeader->id)
+        {
+            const auto oldId = it->first;
+            auto       node  = recruits.extract(it);
+            node.key()             = PLeader->id;
+            node.mapped().leaderId = PLeader->id;
+            node.mapped().partyId  = partyId;
+            auto inserted          = recruits.insert(std::move(node));
+            if (!inserted.inserted)
+            {
+                // That leader already has a row. Put this party back on its old key.
+                inserted.node.key() = oldId;
+                auto restored       = recruits.insert(std::move(inserted.node));
+                return restored.inserted ? &restored.position->second : &inserted.position->second;
+            }
+            return &inserted.position->second;
+        }
+        it->second.partyId = partyId;
+        return &it->second;
+    }
+    return nullptr;
+}
+
+void recruitInvited(const uint32 leaderId, const timer::time_point now)
+{
+    if (auto* rec = recruitByLeader(leaderId))
+    {
+        rec->nextInvite = now + std::chrono::seconds(4);
+    }
+}
+
+void askHeadOut(CCharEntity* PMember)
+{
+    if (PMember == nullptr)
+    {
+        return;
+    }
+    if (auto* rec = recruitFor(PMember))
+    {
+        rec->depart = true;
+        return;
+    }
+    if (PMember->PParty != nullptr && PMember->PParty->GetLeader() != nullptr)
+    {
+        departSoon.insert(PMember->PParty->GetLeader()->id);
+    }
+}
+
 void emote(Bot& bot, PacketSystem& packets, const xi::Emote emote, const CBaseEntity* PTarget)
 {
     auto  packet       = makePacket<GP_CLI_COMMAND_MOTION>();
@@ -1617,8 +1989,8 @@ auto inspect(const Bot& bot) -> std::vector<std::string>
         return { fmt::format("{} isn't online.", bot.name) };
     }
 
-    static constexpr std::array<const char*, static_cast<std::size_t>(OrderKind::Ability) + 1> orders = {
-        "cast", "provoke", "attack", "stop", "rest", "stay", "follow", "pull", "stop pulling", "camp", "assist", "ability",
+    static constexpr std::array<const char*, static_cast<std::size_t>(OrderKind::HeadOut) + 1> orders = {
+        "cast", "provoke", "attack", "stop", "rest", "stay", "follow", "pull", "stop pulling", "camp", "assist", "ability", "head out",
     };
     static_assert(orders.back() != nullptr, "one name per OrderKind");
 
@@ -1679,6 +2051,14 @@ void leaveParty(Bot& bot, PacketSystem& packets)
     if (bot.entity()->PParty != nullptr)
     {
         leaveOrBreakUp(bot, packets, false);
+    }
+}
+
+void disbandParty(Bot& bot, PacketSystem& packets)
+{
+    if (bot.entity() != nullptr && bot.entity()->PParty != nullptr)
+    {
+        leaveOrBreakUp(bot, packets, true);
     }
 }
 
@@ -1950,6 +2330,82 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         }
     }
 
+    // Once per party, from the zone they accepted in. The leader is not a join.
+    if (PChar->PParty != nullptr && PChar->PParty->GetLeader() != PChar)
+    {
+        const auto partyId = PChar->PParty->GetPartyID();
+        if (bot.notedParty != partyId)
+        {
+            bot.notedParty = partyId;
+            const auto* PLead = PChar->PParty->GetLeader();
+            const auto  from  = bot.joinedFrom;
+            ShowInfoFmt("bots: {} joins {}'s party (from zone {})", bot.name, PLead != nullptr ? PLead->getName() : "?",
+                        campZoneText(PChar, from != xi::ZoneId{} ? from : PChar->getZone()));
+        }
+    }
+    else if (PChar->PParty == nullptr)
+    {
+        bot.notedParty = 0;
+        bandLeft.erase(PChar->id);
+    }
+
+    // Out of the band: the party's bots span more than twice the spread. Real players are not measured and never removed.
+    // The outlier leaves (the side farther from the other bots; the higher side on a tie, the one who leveled faster).
+    // A party that levels together keeps a small span and picks a new camp instead of emptying.
+    // bandLeft: the leave was already sent, so this does not log again every tick while the party still lists them.
+    if (!bandLeft.contains(PChar->id))
+    {
+        if (auto* rec = recruitFor(PChar); rec != nullptr && PChar->PParty != nullptr && PChar->PParty->members.size() > 1 && PChar->PAI != nullptr &&
+                                           !PChar->PAI->IsEngaged() && PChar->GetBattleTarget() == nullptr)
+        {
+            int lo  = 255;
+            int hi  = 0;
+            int sum = 0;
+            int n   = 0;
+            for (const auto* PMember : PChar->PParty->members)
+            {
+                if (PMember->objtype != TYPE_PC || !isPoolChar(PMember->id))
+                {
+                    continue;
+                }
+                const int level = static_cast<int>(PMember->GetMLevel());
+                lo              = std::min(lo, level);
+                hi              = std::max(hi, level);
+                sum += level;
+                ++n;
+            }
+            if (n >= 2 && hi - lo > partySpread() * 2)
+            {
+                const int  avg      = sum / n;
+                const bool kickHigh = hi - avg >= avg - lo;
+                const int  extreme  = kickHigh ? hi : lo;
+                uint32     kickId   = 0;
+                bool       found    = false;
+                for (const auto* PMember : PChar->PParty->members)
+                {
+                    if (PMember->objtype != TYPE_PC || !isPoolChar(PMember->id) || static_cast<int>(PMember->GetMLevel()) != extreme)
+                    {
+                        continue;
+                    }
+                    if (!found || PMember->id < kickId)
+                    {
+                        kickId = PMember->id;
+                        found  = true;
+                    }
+                }
+                if (found && PChar->id == kickId)
+                {
+                    bandLeft.insert(PChar->id);
+                    const auto* PLead = PChar->PParty->GetLeader();
+                    partySay(bot, "out of the level range");
+                    ShowInfoFmt("bots: {} leaves {}'s party: out of band", bot.name, PLead != nullptr ? PLead->getName() : "?");
+                    leaveParty(bot, packets);
+                    return;
+                }
+            }
+        }
+    }
+
     // A real player's party is not the solo grind. Drop a half-finished walk so leaving later starts clean.
     if (bot.withPlayer || PChar->PParty != nullptr)
     {
@@ -1975,7 +2431,30 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     }
     else if (joinRequest && (PChar->PParty == nullptr || PChar->PParty->GetLeader() == PChar))
     {
-        invite(bot, packets, joinRequest->first, joinRequest->second);
+        // A player who asked in with /prcmd. Same band as every other invite. Unknown level: let it through.
+        int lo     = static_cast<int>(PChar->GetMLevel());
+        int hi     = lo;
+        int center = lo;
+        if (const auto* rec = recruitFor(PChar))
+        {
+            center = static_cast<int>(rec->center);
+        }
+        if (PChar->PParty != nullptr)
+        {
+            lo = 255;
+            hi = 0;
+            for (const auto* PMember : PChar->PParty->members)
+            {
+                lo = std::min(lo, static_cast<int>(PMember->GetMLevel()));
+                hi = std::max(hi, static_cast<int>(PMember->GetMLevel()));
+            }
+        }
+        const auto* PAsk   = zoneutils::GetChar(joinRequest->first);
+        const bool  inBand = PAsk == nullptr || fitsBand(center, lo, hi, static_cast<int>(PAsk->GetMLevel()));
+        if (inBand)
+        {
+            invite(bot, packets, joinRequest->first, joinRequest->second);
+        }
     }
     else if (!bot.invites.empty() && (PChar->PParty == nullptr || (PChar->PParty->GetLeader() == PChar && !PChar->PParty->IsFull())))
     {
@@ -1983,7 +2462,27 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         bot.invites.erase(bot.invites.begin());
         if (auto* PTarget = zoneutils::GetCharByName(name); PTarget != nullptr && PTarget->PParty == nullptr && PTarget != PChar)
         {
-            invite(bot, packets, PTarget->id, PTarget->getZone() == PChar->getZone() ? PTarget->targid : 0);
+            int lo     = static_cast<int>(PChar->GetMLevel());
+            int hi     = lo;
+            int center = lo;
+            if (const auto* rec = recruitFor(PChar))
+            {
+                center = static_cast<int>(rec->center);
+            }
+            if (PChar->PParty != nullptr)
+            {
+                lo = 255;
+                hi = 0;
+                for (const auto* PMember : PChar->PParty->members)
+                {
+                    lo = std::min(lo, static_cast<int>(PMember->GetMLevel()));
+                    hi = std::max(hi, static_cast<int>(PMember->GetMLevel()));
+                }
+            }
+            if (fitsBand(center, lo, hi, static_cast<int>(PTarget->GetMLevel())))
+            {
+                invite(bot, packets, PTarget->id, PTarget->getZone() == PChar->getZone() ? PTarget->targid : 0);
+            }
         }
     }
     else if (PChar->PParty != nullptr && PChar->PParty->GetLeader() != PChar)
@@ -2040,7 +2539,8 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             }
         }
         const bool capped  = tick >= bot.returnUntil;
-        if (capped || arrived || bot.withPlayer || !bot.returnCamp)
+        // A wipe-return stops when a real player is in the party. A head-out they asked for, or a full party, keeps going.
+        if (capped || arrived || (bot.withPlayer && !bot.headingOut) || !bot.returnCamp)
         {
             if (capped && !arrived && !bot.withPlayer && bot.returnCamp)
             {
@@ -2055,12 +2555,48 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     if (!bot.citizen)
     {
         joinOuting(bot, PChar, botIds, tick);
+        // The camp was picked at an average the party has since left behind. Between fights, pick another.
+        if (auto* rec = recruitFor(PChar); rec != nullptr && rec->atCamp && rec->campAvg > 0 && PChar->PParty != nullptr && PChar->PParty->GetLeader() == PChar &&
+                                           !partyBusy(PChar) && averageLevel(PChar) >= static_cast<int>(rec->campAvg) + 3)
+        {
+            rec->depart = true;
+        }
         startHeadOut(bot, PChar, botIds, tick);
     }
 
+    // Still in the wrong zone for the party being built, or for the camp it is recruiting at. Zone, then walk.
+    // Never while walking out or back (returnUntil set): startHeadOut has already set rec->zone to the camp's,
+    // and the walk is the point. Only a walk that hit its cap, or a recruit from elsewhere, is zoned.
+    if (const auto* rec = recruitFor(PChar); rec != nullptr && bot.returnUntil == timer::time_point{} && PChar->loc.zone != nullptr && PChar->getZone() != rec->zone && !PChar->isDead() && !PChar->isInEvent() &&
+                                             !(bot.gather && bot.gather->waiting) && PChar->status == xi::Status::Normal)
+    {
+        const bool attacked = PTarget != nullptr && PTarget->GetBattleTarget() == PChar;
+        if (!attacked && (PChar->PAI == nullptr || !PChar->PAI->IsEngaged()))
+        {
+            if (PChar->StatusEffectContainer != nullptr && PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing))
+            {
+                setResting(bot, packets, false);
+            }
+            const auto pos = spotNear(rec->zone, rec->spot, 2.0f, 8.0f);
+            travel(PChar, rec->zone, pos);
+            return;
+        }
+    }
+
+    // The walk back ended short of the camp zone (the ten minute cap). travel() above lands them; this is the arrival.
+    if (auto* rec = recruitFor(PChar); rec != nullptr && !rec->atCamp && rec->campAvg > 0 && bot.returnUntil == timer::time_point{} &&
+                                       PChar->PParty != nullptr && PChar->PParty->GetLeader() == PChar && PChar->loc.zone != nullptr &&
+                                       PChar->getZone() == rec->zone)
+    {
+        rec->atCamp = true;
+    }
+
+    const auto* gathering = recruitFor(PChar);
+    const bool holdGather = gathering != nullptr && !gathering->atCamp && bot.returnUntil == timer::time_point{};
+
     // No real player around to see it: the bot stands idle, only fighting back if something attacks it.
-    // A party still walking back to its camp is exempt until the clear above.
-    if (!active && bot.returnUntil == timer::time_point{} && (PTarget == nullptr || PTarget->GetBattleTarget() != PChar))
+    // A party still walking back to its camp, or still filling at its spot, is exempt until that is done.
+    if (!active && !holdGather && bot.returnUntil == timer::time_point{} && (PTarget == nullptr || PTarget->GetBattleTarget() != PChar))
     {
         if (bot.citizen)
         {
@@ -2158,6 +2694,17 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     if (!bot.citizen && pull(bot, packets, PChar, PLeader, tick))
     {
         return;
+    }
+
+    // Filling the party: no hunting. Something that is actually on the party is still fought.
+    if (holdGather && PTarget != nullptr && (PTarget->GetBattleTarget() == nullptr || !inParty(PChar, PTarget->GetBattleTarget())))
+    {
+        bot.focusTarget = 0;
+        if (PChar->PAI != nullptr && PChar->PAI->IsEngaged())
+        {
+            sendAction(bot, packets, GP_CLI_COMMAND_ACTION_ACTIONID::AttackOff, PChar);
+        }
+        PTarget = nullptr;
     }
 
     if (PTarget != nullptr)
@@ -2283,7 +2830,22 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         return;
     }
 
-    if (PGuide != nullptr)
+    if (holdGather && gathering != nullptr && PChar->getZone() == gathering->zone)
+    {
+        // The leader holds the spot they started at. Everyone else follows them there. Resting already returned above.
+        if (PChar->PParty == nullptr || PChar->PParty->GetLeader() == PChar)
+        {
+            if (distance(PChar->loc.p, gathering->spot) > 8.0f)
+            {
+                walkTo(PChar, gathering->spot, 4.0f, tick);
+            }
+        }
+        else if (!bot.stay && PGuide != nullptr)
+        {
+            follow(PChar, PGuide, tick);
+        }
+    }
+    else if (PGuide != nullptr)
     {
         if (const auto camp = campSpot(PChar))
         {

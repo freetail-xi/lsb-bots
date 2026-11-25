@@ -1298,6 +1298,16 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
                 const auto& text       = listeners.front().heard.text;
                 const auto  puller     = PSender != nullptr ? pullerOf(PSender) : 0;
                 const bool  otherNamed = std::ranges::any_of(hearing, [&](const Bot* bot) { return bot->charId != puller && mentions(text, bot->name); });
+                // "head out" / "ready": the keyword order, not the model. The model treats "head out" as breaking camp to follow.
+                if (PSender != nullptr && !isPoolChar(PSender->id) && isHeadOutLine(text))
+                {
+                    auto plans = planOrder(text, PSender, hearing);
+                    if (!plans.empty())
+                    {
+                        carryOut(plans, listeners.front().heard);
+                        continue;
+                    }
+                }
                 if (const auto note = otherNamed ? std::nullopt : recallPuller(text, PSender))
                 {
                     carryOut(choicePlans(*note, text, PSender, hearing), listeners.front().heard);
@@ -1343,7 +1353,7 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
 namespace
 {
 
-// Within LEVEL_WINDOW of this bot. A player who isn't online to check is not blocked.
+// Inside the party band. A player who isn't online to check is not blocked. No party yet: within PARTY_LEVEL_SPREAD of this bot.
 auto levelNear(const CCharEntity* PChar, const std::string& name) -> bool
 {
     if (PChar == nullptr)
@@ -1355,8 +1365,25 @@ auto levelNear(const CCharEntity* PChar, const std::string& name) -> bool
     {
         return true;
     }
-    const auto window = static_cast<int>(settings::get<uint32>("bots.LEVEL_WINDOW"));
-    return std::abs(static_cast<int>(PChar->GetMLevel()) - static_cast<int>(PPlayer->GetMLevel())) <= window;
+    const int level = static_cast<int>(PPlayer->GetMLevel());
+    int       lo    = static_cast<int>(PChar->GetMLevel());
+    int       hi    = lo;
+    int       center = lo;
+    if (const auto* rec = recruitFor(PChar))
+    {
+        center = static_cast<int>(rec->center);
+    }
+    if (PChar->PParty != nullptr)
+    {
+        lo = 255;
+        hi = 0;
+        for (const auto* PMember : PChar->PParty->members)
+        {
+            lo = std::min(lo, static_cast<int>(PMember->GetMLevel()));
+            hi = std::max(hi, static_cast<int>(PMember->GetMLevel()));
+        }
+    }
+    return fitsBand(center, lo, hi, level);
 }
 
 // The usual answer to a line nobody gave an order in.
@@ -1497,8 +1524,8 @@ void respond(std::vector<Listener>& listeners)
             }
         }
 
-        // Someone looking for a group out loud gets one invite, from a bot without a party whose level is close.
-        // A bot further than LEVEL_WINDOW does not take that invite, and does not block one who is close enough.
+        // Someone looking for a group out loud gets one invite, from a bot without a party whose level is in the band.
+        // A bot outside PARTY_LEVEL_SPREAD does not take that invite, and does not block one who is close enough.
         const bool party   = wantsParty(listeners.front().heard.text) && !saysNoInvites(listeners.front().heard.text);
         auto       free    = listeners.end();
         bool       anyFree = false;
@@ -1677,7 +1704,33 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, co
             continue;
         }
 
-        if (PChar->PParty != nullptr && bot.withPlayer && partyMinutes > 0)
+        // A short party's leader shouts the band and the open slots, on the same timer as an unpartied LFP.
+        const auto* rec = recruitFor(PChar);
+        const bool leadingShort = rec != nullptr && (PChar->PParty == nullptr || (PChar->PParty->GetLeader() == PChar && PChar->PParty->members.size() < 6));
+        if (leadingShort && shoutMinutes > 0 && tick >= bot.nextChatter)
+        {
+            bot.nextChatter = tick + jitter(shoutMinutes);
+
+            bool heard = false;
+            PChar->loc.zone->ForEachChar(
+                [&](CCharEntity* POther)
+                {
+                    heard = heard || !botNames.contains(POther->getName());
+                });
+            if (heard)
+            {
+                if (const auto quiet = quietUntil.find(bot.charId); quiet == quietUntil.end() || timer::now() >= quiet->second)
+                {
+                    auto line = lfmLine(PChar, rec->center);
+                    if (!line.empty())
+                    {
+                        std::lock_guard lock(shared.mutex);
+                        shared.replies.push_back({ bot.charId, MESSAGE_SHOUT, {}, std::move(line), timer::now(), false, true });
+                    }
+                }
+            }
+        }
+        else if (PChar->PParty != nullptr && bot.withPlayer && partyMinutes > 0)
         {
             auto& quiet         = partyQuietUntil[PChar->PParty->GetPartyID()];
             const bool afterFight = bot.foughtAt != timer::time_point{} && tick - bot.foughtAt < std::chrono::seconds(10) && !PChar->PAI->IsEngaged();
@@ -1760,6 +1813,12 @@ void deliverChat(std::vector<Bot>& online, PacketSystem& packets)
 }
 
 // Party announcements, like a player's macros: raises and two-hours from everyone, weapon skills and provokes only from the talkative.
+void partySay(const Bot& bot, const std::string& text)
+{
+    std::lock_guard lock(shared.mutex);
+    shared.replies.push_back({ bot.charId, MESSAGE_PARTY, {}, text, timer::now(), true, true });
+}
+
 void callout(const Bot& bot, const std::string& text, const bool macro)
 {
     constexpr uint8 kMacroChattiness = 40;
