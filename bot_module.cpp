@@ -722,7 +722,8 @@ class BotModule : public CPPModule
             {
                 auto*      PPending = bot.entity();
                 const auto dest     = PPending != nullptr ? PPending->loc.destination : xi::ZoneId{};
-                const auto toPort   = bots::zonePort(dest);
+                // Split only: zonePort is a zone_settings query, and one map process never hands off.
+                const auto toPort   = bots::splitMode() && !bots::zoneLocal(dest) ? bots::zonePort(dest) : uint16{};
                 // The zone server already saved the move (a homepoint, or any zone change travel() did not catch).
                 if (bots::splitMode() && PPending != nullptr && !bots::zoneLocal(dest) && toPort != 0 && toPort != bots::mapPort())
                 {
