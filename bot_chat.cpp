@@ -1705,7 +1705,7 @@ void chatter(std::vector<Bot>& online, const std::set<std::string>& botNames, co
         }
 
         // A short party's leader shouts the band and the open slots, on the same timer as an unpartied LFP.
-        const auto* rec = recruitByLeader(bot.charId);
+        const auto* rec = recruitFor(PChar);
         const bool leadingShort = rec != nullptr && (PChar->PParty == nullptr || (PChar->PParty->GetLeader() == PChar && PChar->PParty->members.size() < 6));
         if (leadingShort && shoutMinutes > 0 && tick >= bot.nextChatter)
         {

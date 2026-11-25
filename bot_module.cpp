@@ -182,7 +182,7 @@ auto rolesOf(const std::vector<bots::Bot*>& group) -> Roles
     return roles;
 }
 
-// Tank, then a healer from 15 up, then one support, then anyone. The first candidate that fills the earliest open slot.
+// Tank, then a healer from 15 up, then one support, then damage. Best of that slot: tank score, healer rank, puller rank.
 auto pickRole(const Roles& roles, const std::vector<bots::Bot*>& candidates) -> bots::Bot*
 {
     const bool wantHealer = roles.highest >= kHealerLevel && !roles.healer;
@@ -208,9 +208,45 @@ auto pickRole(const Roles& roles, const std::vector<bots::Bot*>& candidates) -> 
     }
     slots.push_back(Slot::Any);
 
+    // true when a is the better fill. Puller rank is lower-is-better, the same order fillParty used to sort by.
+    const auto better = [](const bots::Bot* a, const bots::Bot* b, const Slot slot) -> bool
+    {
+        auto* PCharA = a->entity();
+        auto* PCharB = b->entity();
+        if (slot == Slot::Healer)
+        {
+            const int ra = healerRank(PCharA->GetMJob());
+            const int rb = healerRank(PCharB->GetMJob());
+            if (ra != rb)
+            {
+                return ra > rb;
+            }
+        }
+        else if (slot == Slot::Tank)
+        {
+            const int ra = tankScore(PCharA->GetMJob());
+            const int rb = tankScore(PCharB->GetMJob());
+            if (ra != rb)
+            {
+                return ra > rb;
+            }
+        }
+        else
+        {
+            const int ra = bots::pullerRank(PCharA->GetMJob(), PCharA->GetMLevel());
+            const int rb = bots::pullerRank(PCharB->GetMJob(), PCharB->GetMLevel());
+            if (ra != rb)
+            {
+                return ra < rb;
+            }
+        }
+        return PCharA->GetMLevel() > PCharB->GetMLevel();
+    };
+
     for (const auto slot : slots)
     {
-        bots::Bot* any = nullptr;
+        bots::Bot* best     = nullptr;
+        bots::Bot* fallback = nullptr;
         for (auto* bot : candidates)
         {
             auto* PChar = bot->entity();
@@ -218,27 +254,30 @@ auto pickRole(const Roles& roles, const std::vector<bots::Bot*>& candidates) -> 
             {
                 continue;
             }
-            const auto job = PChar->GetMJob();
-            const bool fills = slot == Slot::Tank ? bots::isTank(job)
-                               : slot == Slot::Healer ? healerRank(job) > 0
-                               : slot == Slot::Support ? isSupportJob(job)
-                                                       : !bots::isTank(job) && healerRank(job) == 0 && !isSupportJob(job);
-            if (slot != Slot::Any && fills)
+            const auto job   = PChar->GetMJob();
+            const bool tank  = bots::isTank(job);
+            const bool heal  = healerRank(job) > 0;
+            const bool supp  = isSupportJob(job);
+            const bool fills = slot == Slot::Tank ? tank : slot == Slot::Healer ? heal : slot == Slot::Support ? supp : !tank && !heal && !supp;
+            if (fills && (best == nullptr || better(bot, best, slot)))
             {
-                return bot;
+                best = bot;
             }
-            if (slot == Slot::Any && fills)
+            if (slot == Slot::Any && (fallback == nullptr || better(bot, fallback, slot)))
             {
-                return bot;
-            }
-            if (slot == Slot::Any && any == nullptr)
-            {
-                any = bot;
+                fallback = bot;
             }
         }
-        if (slot == Slot::Any)
+        if (slot != Slot::Any)
         {
-            return any;
+            if (best != nullptr)
+            {
+                return best;
+            }
+        }
+        else
+        {
+            return best != nullptr ? best : fallback;
         }
     }
     return nullptr;
@@ -859,6 +898,10 @@ class BotModule : public CPPModule
         const auto idle     = [](const bots::Bot& bot)
         {
             auto* PChar = bot.entity();
+            if (PChar == nullptr)
+            {
+                return false;
+            }
             if (PChar->PAI != nullptr && (PChar->PAI->IsEngaged() || PChar->GetBattleTarget() != nullptr))
             {
                 return false;
@@ -872,6 +915,57 @@ class BotModule : public CPPModule
                 return false;
             }
             return PChar->status == xi::Status::Normal && !PChar->isDead();
+        };
+
+        // An open party's current band. A full party is not still taking people.
+        const auto couldTake = [&](const bots::PartyRecruit& row, const int level) -> bool
+        {
+            const auto leader = std::ranges::find_if(online_, [&](const bots::Bot& bot) { return bot.charId == row.leaderId; });
+            int        lo     = static_cast<int>(row.center);
+            int        hi     = lo;
+            if (leader != online_.end() && leader->entity() != nullptr && leader->entity()->PParty != nullptr)
+            {
+                auto* PParty = leader->entity()->PParty;
+                if (PParty->IsFull() || PParty->members.size() >= 6)
+                {
+                    return false;
+                }
+                lo = 255;
+                hi = 0;
+                for (const auto* PMember : PParty->members)
+                {
+                    lo = std::min(lo, static_cast<int>(PMember->GetMLevel()));
+                    hi = std::max(hi, static_cast<int>(PMember->GetMLevel()));
+                }
+            }
+            return bots::fitsBand(static_cast<int>(row.center), lo, hi, level);
+        };
+        // Same zone as this bot, and that party would still invite them. Left for it, not pulled across zones.
+        const auto held = [&](const bots::Bot& candidate, const uint32 exceptId) -> bool
+        {
+            auto* PCand = candidate.entity();
+            if (PCand == nullptr || PCand->loc.zone == nullptr)
+            {
+                return false;
+            }
+            const int level = static_cast<int>(PCand->GetMLevel());
+            for (const auto other : bots::recruitLeaderIds())
+            {
+                if (other == exceptId)
+                {
+                    continue;
+                }
+                const auto* row = bots::recruitByLeader(other);
+                if (row == nullptr || row->zone != PCand->getZone())
+                {
+                    continue;
+                }
+                if (couldTake(*row, level))
+                {
+                    return true;
+                }
+            }
+            return false;
         };
 
         std::set<std::string> pending;
@@ -891,6 +985,7 @@ class BotModule : public CPPModule
         }
 
         // Existing parties first, so a new party doesn't take the bots they are about to invite.
+        // The key stays on the bot who started it. When that bot has left, or logged out, move it to the bot who leads now.
         for (const auto id : bots::recruitLeaderIds())
         {
             auto* rec = bots::recruitByLeader(id);
@@ -898,27 +993,79 @@ class BotModule : public CPPModule
             {
                 continue;
             }
-            const auto bot = std::ranges::find_if(online_, [&](const bots::Bot& candidate) { return candidate.charId == id; });
-            if (bot == online_.end() || bot->entity() == nullptr || bot->citizen)
+
+            const auto findBot = [&](const uint32 charId)
             {
-                bots::dropRecruit(id);
-                continue;
+                return std::ranges::find_if(online_, [&](const bots::Bot& candidate) { return candidate.charId == charId; });
+            };
+            const auto leads = [](const bots::Bot& candidate)
+            {
+                auto* P = candidate.entity();
+                return P != nullptr && !candidate.citizen && P->PParty != nullptr && P->PParty->GetLeader() == P;
+            };
+            const auto solo = [&](const bots::Bot& candidate)
+            {
+                auto* P = candidate.entity();
+                return P != nullptr && !candidate.citizen && P->PParty == nullptr && rec->partyId == 0 && rec->campAvg == 0 && !rec->atCamp;
+            };
+            const auto inThisParty = [&](const bots::Bot& candidate)
+            {
+                auto* P = candidate.entity();
+                if (P == nullptr || P->PParty == nullptr)
+                {
+                    return false;
+                }
+                if (rec->partyId != 0 && P->PParty->GetPartyID() == rec->partyId)
+                {
+                    return true;
+                }
+                const auto* PLeader = P->PParty->GetLeader();
+                return PLeader != nullptr && PLeader->id == id;
+            };
+
+            auto holder = findBot(id);
+            if (holder == online_.end() || (!leads(*holder) && !solo(*holder)))
+            {
+                holder = online_.end();
+                for (auto it = online_.begin(); it != online_.end(); ++it)
+                {
+                    if (leads(*it) && inThisParty(*it))
+                    {
+                        holder = it;
+                        break;
+                    }
+                }
+                if (holder == online_.end())
+                {
+                    bool member = false;
+                    for (const auto& candidate : online_)
+                    {
+                        if (inThisParty(candidate))
+                        {
+                            member = true;
+                            break;
+                        }
+                    }
+                    if (!member)
+                    {
+                        bots::dropRecruit(id);
+                    }
+                    continue;
+                }
+                if (auto old = findBot(id); old != online_.end())
+                {
+                    old->invites.clear();
+                }
+                bots::recruitFor(holder->entity());
+                rec = bots::recruitByLeader(holder->charId);
+                if (rec == nullptr)
+                {
+                    continue;
+                }
             }
 
-            auto* PChar = bot->entity();
-            if (PChar->PParty != nullptr && PChar->PParty->GetLeader() != PChar)
-            {
-                if (auto* PLead = dynamic_cast<CCharEntity*>(PChar->PParty->GetLeader()))
-                {
-                    bots::recruitFor(PLead);
-                }
-                continue;
-            }
-            rec = bots::recruitByLeader(PChar->id);
-            if (rec == nullptr)
-            {
-                continue;
-            }
+            bots::Bot* bot   = &*holder;
+            auto*      PChar = bot->entity();
             if (PChar->PParty != nullptr)
             {
                 rec->partyId = PChar->PParty->GetPartyID();
@@ -961,22 +1108,6 @@ class BotModule : public CPPModule
                 }
             }
 
-            const auto zoneTaken = [&](const xi::ZoneId zone)
-            {
-                for (const auto other : bots::recruitLeaderIds())
-                {
-                    if (other == PChar->id)
-                    {
-                        continue;
-                    }
-                    if (const auto* row = bots::recruitByLeader(other); row != nullptr && row->zone == zone)
-                    {
-                        return true;
-                    }
-                }
-                return false;
-            };
-
             const auto eligible = [&](bots::Bot& candidate, const bool otherZone)
             {
                 auto* PCand = candidate.entity();
@@ -990,7 +1121,8 @@ class BotModule : public CPPModule
                 {
                     return PCand->getZone() == rec->zone;
                 }
-                return PCand->getZone() != rec->zone && idle(candidate) && !zoneTaken(PCand->getZone());
+                // Idle, and not someone a party already recruiting in their own zone can still take.
+                return PCand->getZone() != rec->zone && idle(candidate) && !held(candidate, PChar->id);
             };
 
             std::vector<bots::Bot*> same;
@@ -1071,7 +1203,7 @@ class BotModule : public CPPModule
             bots::recruitInvited(PChar->id, now);
         }
 
-        // One new party per pass. A zone that already has one is left to it. A lone bot waits if some other party can recruit them.
+        // One new party per pass. Bots a party in this zone can still take are left to it. A lone bot waits if any open party fits them.
         std::map<xi::ZoneId, std::vector<bots::Bot*>> byZone;
         for (auto& bot : online_)
         {
@@ -1084,40 +1216,43 @@ class BotModule : public CPPModule
             byZone[PChar->getZone()].push_back(&bot);
         }
 
-        const bool anyRecruit = !bots::recruitLeaderIds().empty();
         xi::ZoneId bestZone{};
         int        bestCount = 0;
-        for (const auto& [zone, bots] : byZone)
+        for (auto& [zone, bots] : byZone)
         {
             if (!activeEverywhere && !occupied.contains(zone))
             {
                 continue;
             }
-            bool taken = false;
-            for (const auto id : bots::recruitLeaderIds())
-            {
-                if (const auto* row = bots::recruitByLeader(id); row != nullptr && row->zone == zone)
-                {
-                    taken = true;
-                }
-            }
-            if (taken)
-            {
-                continue;
-            }
+            std::erase_if(bots, [&](const bots::Bot* candidate) { return held(*candidate, 0) || bots::leaderCooling(candidate->charId, now); });
             if (static_cast<int>(bots.size()) > bestCount)
             {
                 bestCount = static_cast<int>(bots.size());
                 bestZone  = zone;
             }
         }
-        if (bestCount == 0 || (bestCount < 2 && anyRecruit))
+        if (bestCount == 0)
         {
             return;
         }
+        if (bestCount < 2)
+        {
+            auto*       only  = byZone[bestZone].front();
+            const auto* POnly = only->entity();
+            if (POnly != nullptr)
+            {
+                const int level = static_cast<int>(POnly->GetMLevel());
+                for (const auto other : bots::recruitLeaderIds())
+                {
+                    if (const auto* row = bots::recruitByLeader(other); row != nullptr && couldTake(*row, level))
+                    {
+                        return;
+                    }
+                }
+            }
+        }
 
         auto seeds = byZone[bestZone];
-        std::erase_if(seeds, [&](const bots::Bot* bot) { return bots::leaderCooling(bot->charId, now); });
         if (seeds.empty())
         {
             return;
@@ -1170,7 +1305,7 @@ class BotModule : public CPPModule
                 continue;
             }
 
-            const bool recruiting = bots::recruitByLeader(bot.charId) != nullptr;
+            const bool recruiting = bots::recruitFor(PChar) != nullptr && (PChar->PParty == nullptr || PChar->PParty->GetLeader() == PChar);
             if (!recruiting)
             {
                 if (PChar->PParty == nullptr)
@@ -1228,7 +1363,7 @@ class BotModule : public CPPModule
                 }
             }
 
-            const auto* rec    = bots::recruitByLeader(bot.charId);
+            const auto* rec    = bots::recruitFor(PChar);
             const auto  center = static_cast<uint8>(rec != nullptr ? rec->center : PChar->GetMLevel());
             const bool  wantHealer = std::max(lo, hi) >= kHealerLevel && !healerTaken;
             offers.push_back(Offer{ &bot, lo, hi, center, !hasTank, wantHealer, !hasSupport, true, recruiting });
@@ -1357,7 +1492,7 @@ class BotModule : public CPPModule
                               int         lo      = static_cast<int>(PLeader->GetMLevel());
                               int         hi      = lo;
                               int         center  = lo;
-                              if (const auto* rec = bots::recruitByLeader(bot->charId))
+                              if (const auto* rec = bots::recruitFor(PLeader))
                               {
                                   center = static_cast<int>(rec->center);
                               }
@@ -1660,7 +1795,30 @@ class BotModule : public CPPModule
             bots::breakCamp(PChar);
         }
         bots::dropOuting(bot.charId);
-        bots::dropRecruit(bot.charId);
+        // Another bot is still in this party: keep the row so the next formParties moves it onto whoever leads.
+        bool keepRecruit = false;
+        if (PChar != nullptr && PChar->PParty != nullptr && bots::recruitByLeader(bot.charId) != nullptr)
+        {
+            for (const auto* PMember : PChar->PParty->members)
+            {
+                if (PMember != PChar && PMember->objtype == TYPE_PC && bots::isPoolChar(PMember->id))
+                {
+                    keepRecruit = true;
+                    break;
+                }
+            }
+            if (keepRecruit)
+            {
+                if (auto* rec = bots::recruitByLeader(bot.charId); rec != nullptr && rec->partyId == 0)
+                {
+                    rec->partyId = PChar->PParty->GetPartyID();
+                }
+            }
+        }
+        if (!keepRecruit)
+        {
+            bots::dropRecruit(bot.charId);
+        }
 
         bots::noteLastSeen(bot);
         db::preparedStmt("DELETE FROM accounts_sessions WHERE charid = ?", bot.charId);

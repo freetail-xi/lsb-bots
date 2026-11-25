@@ -933,6 +933,7 @@ struct Outing
 
 std::map<uint32, Outing>       outings;
 std::set<uint32>               departSoon; // a player said to head out and this leader has no recruit row yet
+std::set<uint32>               bandLeft;   // leave packet already sent; the party list has not dropped them yet
 std::map<uint32, PartyRecruit> recruits;
 std::map<uint32, timer::time_point> leadCooldown;
 
@@ -1141,12 +1142,24 @@ void startHeadOut(Bot& bot, CCharEntity* PChar, const std::set<uint32>& /*botIds
     {
         return;
     }
-    // Already camped and still the right level: stay. A player saying "head out", or the average up by 3, sets depart.
-    if (hasPull(PChar) && !depart)
+    if (partyBusy(PChar))
     {
         return;
     }
-    if (partyBusy(PChar))
+    // Someone is still zoning to the party. Leaving now would pick the camp without them.
+    const bool apart = std::ranges::any_of(PChar->PParty->members, [&](const CBattleEntity* PMember)
+                                           {
+                                               if (PMember->objtype != TYPE_PC || !isPoolChar(PMember->id))
+                                               {
+                                                   return false;
+                                               }
+                                               if (PMember->loc.zone == nullptr || PMember->status == xi::Status::Disappear)
+                                               {
+                                                   return true;
+                                               }
+                                               return PChar->loc.zone != nullptr && PMember->getZone() != PChar->getZone();
+                                           });
+    if (apart)
     {
         return;
     }
@@ -1156,7 +1169,8 @@ void startHeadOut(Bot& bot, CCharEntity* PChar, const std::set<uint32>& /*botIds
     {
         breakCamp(PChar);
     }
-    // A pull left over from a zone this party has left keeps hasPull true, and then this look never runs again.
+    // A pull for a zone this party has left keeps hasPull true. Drop that one before deciding to stay.
+    // A camp in this zone, and depart still false, is the party already where it should be.
     dropCampIfLeft(PChar);
     if (hasPull(PChar))
     {
@@ -1663,7 +1677,8 @@ auto partySpread() -> int
 auto fitsBand(const int center, const int lo, const int hi, const int level) -> bool
 {
     const int spread = partySpread();
-    if (std::abs(level - center) > spread)
+    const int gap    = level > center ? level - center : center - level;
+    if (gap > spread)
     {
         return false;
     }
@@ -1737,6 +1752,22 @@ auto recruitByLeader(const uint32 leaderId) -> PartyRecruit*
     return it != recruits.end() ? &it->second : nullptr;
 }
 
+// The row is this character's when they are still the solo recruiter, or still in its party.
+// A leader who already left keeps the key until formParties moves it, and must not be handed the old party.
+auto attached(const CCharEntity* PChar, const PartyRecruit& rec) -> bool
+{
+    if (PChar->PParty == nullptr)
+    {
+        return rec.partyId == 0 && rec.leaderId == PChar->id;
+    }
+    if (rec.partyId != 0 && rec.partyId == PChar->PParty->GetPartyID())
+    {
+        return true;
+    }
+    const auto* PLeader = PChar->PParty->GetLeader();
+    return PLeader != nullptr && rec.leaderId == PLeader->id;
+}
+
 auto recruitFor(const CCharEntity* PChar) -> PartyRecruit*
 {
     if (PChar == nullptr)
@@ -1745,11 +1776,21 @@ auto recruitFor(const CCharEntity* PChar) -> PartyRecruit*
     }
     if (auto it = recruits.find(PChar->id); it != recruits.end())
     {
-        if (PChar->PParty != nullptr)
+        if (!attached(PChar, it->second))
         {
-            it->second.partyId = PChar->PParty->GetPartyID();
+            if (PChar->PParty == nullptr)
+            {
+                return nullptr;
+            }
         }
-        return &it->second;
+        else
+        {
+            if (PChar->PParty != nullptr)
+            {
+                it->second.partyId = PChar->PParty->GetPartyID();
+            }
+            return &it->second;
+        }
     }
     if (PChar->PParty == nullptr)
     {
@@ -1768,11 +1809,19 @@ auto recruitFor(const CCharEntity* PChar) -> PartyRecruit*
         }
         if (PLeader != nullptr && it->first != PLeader->id && PChar->id == PLeader->id)
         {
-            auto node             = recruits.extract(it);
-            node.key()            = PLeader->id;
+            const auto oldId = it->first;
+            auto       node  = recruits.extract(it);
+            node.key()             = PLeader->id;
             node.mapped().leaderId = PLeader->id;
             node.mapped().partyId  = partyId;
-            const auto inserted   = recruits.insert(std::move(node));
+            auto inserted          = recruits.insert(std::move(node));
+            if (!inserted.inserted)
+            {
+                // That leader already has a row. Put this party back on its old key.
+                inserted.node.key() = oldId;
+                auto restored       = recruits.insert(std::move(inserted.node));
+                return restored.inserted ? &restored.position->second : &inserted.position->second;
+            }
             return &inserted.position->second;
         }
         it->second.partyId = partyId;
@@ -2270,21 +2319,63 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     else if (PChar->PParty == nullptr)
     {
         bot.notedParty = 0;
+        bandLeft.erase(PChar->id);
     }
 
-    // Levels faster than the band: leave. A real player is never in this function. Not mid-fight.
-    if (auto* rec = recruitFor(PChar); rec != nullptr && PChar->PParty != nullptr && PChar->PParty->members.size() > 1 && PChar->PAI != nullptr &&
-                                       !PChar->PAI->IsEngaged() && PChar->GetBattleTarget() == nullptr)
+    // Out of the band: the party's bots span more than twice the spread. Real players are not measured and never removed.
+    // The outlier leaves (the side farther from the other bots; the higher side on a tie, the one who leveled faster).
+    // A party that levels together keeps a small span and picks a new camp instead of emptying.
+    // bandLeft: the leave was already sent, so this does not log again every tick while the party still lists them.
+    if (!bandLeft.contains(PChar->id))
     {
-        // Outside the window centred on the leader's level at the start. The span check is for invites:
-        // a real player sitting outside it must not push an in-band bot out.
-        if (std::abs(static_cast<int>(PChar->GetMLevel()) - static_cast<int>(rec->center)) > partySpread())
+        if (auto* rec = recruitFor(PChar); rec != nullptr && PChar->PParty != nullptr && PChar->PParty->members.size() > 1 && PChar->PAI != nullptr &&
+                                           !PChar->PAI->IsEngaged() && PChar->GetBattleTarget() == nullptr)
         {
-            const auto* PLead = PChar->PParty->GetLeader();
-            partySay(bot, "out of the level range");
-            ShowInfoFmt("bots: {} leaves {}'s party: out of band", bot.name, PLead != nullptr ? PLead->getName() : "?");
-            leaveParty(bot, packets);
-            return;
+            int lo  = 255;
+            int hi  = 0;
+            int sum = 0;
+            int n   = 0;
+            for (const auto* PMember : PChar->PParty->members)
+            {
+                if (PMember->objtype != TYPE_PC || !isPoolChar(PMember->id))
+                {
+                    continue;
+                }
+                const int level = static_cast<int>(PMember->GetMLevel());
+                lo              = std::min(lo, level);
+                hi              = std::max(hi, level);
+                sum += level;
+                ++n;
+            }
+            if (n >= 2 && hi - lo > partySpread() * 2)
+            {
+                const int  avg      = sum / n;
+                const bool kickHigh = hi - avg >= avg - lo;
+                const int  extreme  = kickHigh ? hi : lo;
+                uint32     kickId   = 0;
+                bool       found    = false;
+                for (const auto* PMember : PChar->PParty->members)
+                {
+                    if (PMember->objtype != TYPE_PC || !isPoolChar(PMember->id) || static_cast<int>(PMember->GetMLevel()) != extreme)
+                    {
+                        continue;
+                    }
+                    if (!found || PMember->id < kickId)
+                    {
+                        kickId = PMember->id;
+                        found  = true;
+                    }
+                }
+                if (found && PChar->id == kickId)
+                {
+                    bandLeft.insert(PChar->id);
+                    const auto* PLead = PChar->PParty->GetLeader();
+                    partySay(bot, "out of the level range");
+                    ShowInfoFmt("bots: {} leaves {}'s party: out of band", bot.name, PLead != nullptr ? PLead->getName() : "?");
+                    leaveParty(bot, packets);
+                    return;
+                }
+            }
         }
     }
 
@@ -2313,7 +2404,30 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     }
     else if (joinRequest && (PChar->PParty == nullptr || PChar->PParty->GetLeader() == PChar))
     {
-        invite(bot, packets, joinRequest->first, joinRequest->second);
+        // A player who asked in with /prcmd. Same band as every other invite. Unknown level: let it through.
+        int lo     = static_cast<int>(PChar->GetMLevel());
+        int hi     = lo;
+        int center = lo;
+        if (const auto* rec = recruitFor(PChar))
+        {
+            center = static_cast<int>(rec->center);
+        }
+        if (PChar->PParty != nullptr)
+        {
+            lo = 255;
+            hi = 0;
+            for (const auto* PMember : PChar->PParty->members)
+            {
+                lo = std::min(lo, static_cast<int>(PMember->GetMLevel()));
+                hi = std::max(hi, static_cast<int>(PMember->GetMLevel()));
+            }
+        }
+        const auto* PAsk   = zoneutils::GetChar(joinRequest->first);
+        const bool  inBand = PAsk == nullptr || fitsBand(center, lo, hi, static_cast<int>(PAsk->GetMLevel()));
+        if (inBand)
+        {
+            invite(bot, packets, joinRequest->first, joinRequest->second);
+        }
     }
     else if (!bot.invites.empty() && (PChar->PParty == nullptr || (PChar->PParty->GetLeader() == PChar && !PChar->PParty->IsFull())))
     {
@@ -2438,6 +2552,14 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             travel(PChar, rec->zone, pos);
             return;
         }
+    }
+
+    // The walk back ended short of the camp zone (the ten minute cap). travel() above lands them; this is the arrival.
+    if (auto* rec = recruitFor(PChar); rec != nullptr && !rec->atCamp && rec->campAvg > 0 && bot.returnUntil == timer::time_point{} &&
+                                       PChar->PParty != nullptr && PChar->PParty->GetLeader() == PChar && PChar->loc.zone != nullptr &&
+                                       PChar->getZone() == rec->zone)
+    {
+        rec->atCamp = true;
     }
 
     const auto* gathering = recruitFor(PChar);
