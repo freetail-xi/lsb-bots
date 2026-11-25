@@ -10,6 +10,7 @@
 
 #include "map/ai/ai_container.h"
 #include "map/ai/helpers/pathfind.h"
+#include "map/autotranslate.h"
 #include "map/entities/char_entity.h"
 #include "map/entities/mob_entity.h"
 #include "map/entities/npc_entity.h"
@@ -1680,17 +1681,12 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             const auto*    from    = reinterpret_cast<const char*>(&packet->ref<uint8>(payload + offsetof(Data, sName)));
             const auto*    text    = reinterpret_cast<const char*>(&packet->ref<uint8>(payload + offsetof(Data, Mes)));
 
-            // Auto-translate phrases (0xFD ... 0xFD, with id bytes that can look like letters) and other non-ASCII bytes are dropped.
+            // Auto-translate phrases (0xFD ... 0xFD) become their English text in braces, "{ White Mage }", through
+            // LSB's own table, so the model can read them. Any other non-ASCII byte is dropped.
             std::string message;
-            bool        phrase = false;
-            for (const char c : std::string_view(text, strnlen(text, sizeof(Data::Mes))))
+            for (const char c : autotranslate::replaceBytes(std::string(text, strnlen(text, sizeof(Data::Mes)))))
             {
-                if (static_cast<unsigned char>(c) == 0xFD)
-                {
-                    phrase = !phrase;
-                    continue;
-                }
-                if (!phrase && std::isprint(static_cast<unsigned char>(c)))
+                if (std::isprint(static_cast<unsigned char>(c)))
                 {
                     message += c;
                 }
