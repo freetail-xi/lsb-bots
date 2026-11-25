@@ -95,6 +95,7 @@ constexpr float kHeadOutNear     = 30.0f; // a trip out of town ends this close 
 constexpr auto  kHeadOutWait     = std::chrono::minutes(5); // one look for a camp to leave town, per leader
 constexpr auto  kSettleTime      = std::chrono::seconds(2); // the leader has stopped for this long
 constexpr auto  kPlayerGoneGrace = std::chrono::seconds(20);
+constexpr auto  kLeaderAway      = std::chrono::seconds(60); // party leader on another map: wait, then leave
 constexpr uint32 kAttackKey      = 0x30000;
 constexpr uint32 kOutOfMPKey     = 0xB0000; // the mid-fight rest log, once a fight
 
@@ -419,7 +420,7 @@ void moveToSpot(CCharEntity* PChar, const position_t& spot, const timer::time_po
 
 void follow(CCharEntity* PChar, CCharEntity* PLeader, const timer::time_point tick)
 {
-    if (PLeader->loc.zone == nullptr || PLeader->status != xi::Status::Normal || PLeader->inMogHouse())
+    if (PLeader == nullptr || PLeader->loc.zone == nullptr || PLeader->status != xi::Status::Normal || PLeader->inMogHouse())
     {
         return;
     }
@@ -1071,7 +1072,7 @@ auto pickPartyCamp(CCharEntity* PLeader, const uint8 level) -> std::optional<Pla
     std::vector<Place> open;
     for (const auto& camp : findCamps(level))
     {
-        if (!campBlocked(camp.zone, camp.pos, PLeader->id))
+        if (zoneLocal(camp.zone) && !campBlocked(camp.zone, camp.pos, PLeader->id))
         {
             open.push_back(camp);
         }
@@ -1965,8 +1966,21 @@ void weaponSkill(Bot& bot, PacketSystem& packets, const uint16 skillId, const CB
 }
 
 // The same request setPos makes; the zone hands the bot over on its next tick.
+// A zone another map process runs is not zoned here: that would disappear the bot with nowhere to land.
 void travel(CCharEntity* PChar, const xi::ZoneId zone, const position_t& pos)
 {
+    if (splitMode() && !zoneLocal(zone))
+    {
+        const auto toPort = zonePort(zone);
+        if (toPort != 0 && toPort != mapPort())
+        {
+            PChar->loc.p           = pos;
+            PChar->loc.destination = zone;
+            queueHandoff(PChar->id, zone, pos);
+            return;
+        }
+    }
+
     PChar->loc.p               = pos;
     PChar->loc.destination     = zone;
     PChar->loc.boundary        = 0;
@@ -2577,9 +2591,13 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             {
                 setResting(bot, packets, false);
             }
-            const auto pos = spotNear(rec->zone, rec->spot, 2.0f, 8.0f);
-            travel(PChar, rec->zone, pos);
-            return;
+            // A camp on another map is that process's recruit. Zoning at it here would repeat every tick.
+            if (!(splitMode() && !zoneLocal(rec->zone)))
+            {
+                const auto pos = spotNear(rec->zone, rec->spot, 2.0f, 8.0f);
+                travel(PChar, rec->zone, pos);
+                return;
+            }
         }
     }
 
@@ -2593,6 +2611,35 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
 
     const auto* gathering = recruitFor(PChar);
     const bool holdGather = gathering != nullptr && !gathering->atCamp && bot.returnUntil == timer::time_point{};
+
+    // The leader zoned onto another map process. Follow cannot see them. Wait, then leave; never chase every tick.
+    if (splitMode() && PChar->PParty != nullptr && PChar->PParty->GetLeader() != PChar && PChar->loc.zone != nullptr &&
+        bot.returnUntil == timer::time_point{} && !PChar->isDead() && !PChar->isInEvent())
+    {
+        auto*      PLead      = PChar->PParty->GetLeader();
+        const bool leaderHere = PLead != nullptr && PLead->loc.zone != nullptr && zoneutils::GetZone(PLead->getZone()) != nullptr;
+        if (!leaderHere)
+        {
+            if (bot.leaderAwayAt == timer::time_point{})
+            {
+                bot.leaderAwayAt = tick;
+            }
+            else if (tick - bot.leaderAwayAt >= kLeaderAway && (PChar->PAI == nullptr || !PChar->PAI->IsEngaged()))
+            {
+                ShowInfoFmt("bots: {} leaves the party: leader is on another map", PChar->getName());
+                leaveParty(bot, packets);
+                bot.leaderAwayAt = {};
+            }
+        }
+        else
+        {
+            bot.leaderAwayAt = {};
+        }
+    }
+    else
+    {
+        bot.leaderAwayAt = {};
+    }
 
     // No real player around to see it: the bot stands idle, only fighting back if something attacks it.
     // A party still walking back to its camp, or still filling at its spot, is exempt until that is done.
@@ -2621,6 +2668,10 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
                  (PLead->getZone() == bot.returnCamp->zone || PLead->getZone() == PChar->getZone()))
         {
             follow(PChar, PLead, tick);
+        }
+        else if (splitMode() && !zoneLocal(bot.returnCamp->zone))
+        {
+            travel(PChar, bot.returnCamp->zone, bot.returnCamp->pos);
         }
         else if (PChar->PAI != nullptr && PChar->PAI->PathFind != nullptr)
         {

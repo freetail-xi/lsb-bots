@@ -44,6 +44,7 @@ namespace
 {
 
 constexpr auto kPresenceInterval = std::chrono::seconds(5);
+constexpr auto kHandoffInterval  = std::chrono::seconds(3); // arrivals and expired handoffs, not every tick
 constexpr auto kBalanceInterval  = std::chrono::seconds(30);
 constexpr auto kGroupingInterval = std::chrono::seconds(4); // one recruit step: an invite, or a new party
 constexpr auto kSlowStep         = std::chrono::milliseconds(200);
@@ -481,7 +482,8 @@ class BotModule : public CPPModule
         packets_ = std::make_unique<PacketSystem>();
 
         bots::ensureSchema();
-        bots::clearStaleState();
+        const auto split = bots::prepareSplit();
+        bots::clearStaleState(split.port, split.split);
         pool_ = bots::loadPool();
         bots::ensureLinkshell();
 
@@ -512,7 +514,12 @@ class BotModule : public CPPModule
                              return sol::as_table(rotate(count.value_or(0)));
                          });
 
-        ShowInfoFmt("bots: {} in the pool, up to {} online", pool_.size(), settings::get<uint32>("bots.MAX_ONLINE"));
+        ShowInfoFmt("bots: map {} serves {} zones, owns bots in {} of them", split.port, split.zones, split.botZones);
+        if (split.split)
+        {
+            ShowInfoFmt("bots: split mode: {} map processes share the pool", split.processes);
+        }
+        ShowInfoFmt("bots: {} in the pool, up to {} online", pool_.size(), bots::localOnlineCap());
     }
 
     // The engine's scheduler is only reachable through a real player's session.
@@ -624,7 +631,13 @@ class BotModule : public CPPModule
 
         const auto grace  = std::chrono::seconds(settings::get<uint32>("bots.LOGOUT_GRACE"));
         const bool wanted = lastRealPlayer_ != timer::time_point{} && now - lastRealPlayer_ <= kPresenceInterval + grace;
-        const auto target = wanted ? std::min<std::size_t>(settings::get<uint32>("bots.MAX_ONLINE"), pool_.size()) : 0;
+        const auto target = wanted ? std::min<std::size_t>(bots::localOnlineCap(), pool_.size()) : 0;
+
+        if (bots::splitMode() && now >= nextHandoff_)
+        {
+            nextHandoff_ = now + kHandoffInterval;
+            pollHandoffs();
+        }
 
         if (online_.size() < target && now >= nextLogin_)
         {
@@ -637,7 +650,9 @@ class BotModule : public CPPModule
             nextLogout_   = now + std::chrono::seconds(1);
             const auto drop = [&](const bots::Bot& bot)
             {
-                return target == 0 || isFree(bot);
+                // A handoff just landed. Over the share, a free bot can wait; an empty server still logs everyone out.
+                const bool justArrived = target != 0 && bot.arrivedAt != timer::time_point{} && now - bot.arrivedAt < std::chrono::seconds(60);
+                return !justArrived && (target == 0 || isFree(bot));
             };
             auto it = online_.rend();
             if (target != 0)
@@ -705,7 +720,15 @@ class BotModule : public CPPModule
 
             if (bot.session->blowfish.status == BLOWFISH_PENDING_ZONE)
             {
-                if (!enterZone(bot))
+                auto*      PPending = bot.entity();
+                const auto dest     = PPending != nullptr ? PPending->loc.destination : xi::ZoneId{};
+                const auto toPort   = bots::zonePort(dest);
+                // The zone server already saved the move (a homepoint, or any zone change travel() did not catch).
+                if (bots::splitMode() && PPending != nullptr && !bots::zoneLocal(dest) && toPort != 0 && toPort != bots::mapPort())
+                {
+                    handoff(bot, dest, PPending->loc.p);
+                }
+                else if (!enterZone(bot))
                 {
                     logout(bot, true);
                 }
@@ -764,6 +787,25 @@ class BotModule : public CPPModule
             }
         }
 
+        for (const auto& row : bots::takeHandoffs())
+        {
+            const auto bot = std::ranges::find_if(online_, [&](const bots::Bot& candidate) { return candidate.charId == row.charId; });
+            if (bot == online_.end() || bot->entity() == nullptr)
+            {
+                continue;
+            }
+            if (inCutscene(*bot) || !handoff(*bot, row.zone, row.pos))
+            {
+                bots::queueHandoff(row.charId, row.zone, row.pos);
+            }
+        }
+
+        std::erase_if(online_,
+                      [](const auto& bot)
+                      {
+                          return bot.entity() == nullptr;
+                      });
+
         bots::handleChat(online_, poolNames_);
         bots::chatter(online_, poolNames_, now);
         bots::deliverChat(online_, *packets_);
@@ -780,7 +822,8 @@ class BotModule : public CPPModule
     void loginNext()
     {
         const auto citizens = bots::citizenIds(pool_);
-        if (!citizens.empty())
+        const auto citizenZone = static_cast<xi::ZoneId>(settings::get<uint32>("bots.CITIZEN_ZONE"));
+        if (!citizens.empty() && bots::zoneLocal(citizenZone))
         {
             const bots::PoolEntry* citizen = nullptr;
             for (const auto& entry : pool_)
@@ -790,7 +833,7 @@ class BotModule : public CPPModule
                     citizen = &entry;
                 }
             }
-            if (citizen != nullptr)
+            if (citizen != nullptr && bots::claimBot(citizen->charId))
             {
                 bots::placeCitizen(citizen->charId);
                 login(*citizen);
@@ -847,36 +890,76 @@ class BotModule : public CPPModule
 
         const auto* entry = candidates[xirand::GetRandomNumber<std::size_t>(candidates.size())];
 
-        // Below SOLO_BELOW: a starting area, not a town and not a camp somewhere else. 0 keeps the camp / home roll.
-        const auto soloBelow = settings::get<uint32>("bots.SOLO_BELOW");
-        if (soloBelow > 0 && entry->level < soloBelow)
+        // The rolled candidate first. Another map may already own them; the rest of the shortlist is the fallback.
+        std::vector<const bots::PoolEntry*> order{ entry };
+        for (const auto* candidate : candidates)
         {
-            if (const auto place = bots::soloPlace(entry->level, charNation(entry->charId)))
+            if (candidate != entry)
             {
-                bots::placeAt(entry->charId, *place);
-                ShowInfoFmt("bots: {} solos in {} (level {})", entry->name, zoneText(place->zone), static_cast<int>(entry->level));
-            }
-            else
-            {
-                ShowWarningFmt("bots: no starting area for {} (level {}); left where they were", entry->name, static_cast<int>(entry->level));
-            }
-        }
-        else
-        {
-            // Most go out to a camp for their level; the rest start at their pool home.
-            const auto camps = bots::findCamps(entry->level);
-            if (!camps.empty() && xirand::GetRandomNumber<uint32>(100) < settings::get<uint32>("bots.CAMP_CHANCE"))
-            {
-                const auto& camp = camps[xirand::GetRandomNumber<std::size_t>(camps.size())];
-                bots::placeAt(entry->charId, { camp.zone, bots::spotNear(camp.zone, camp.pos, 5.0f, 25.0f) });
-            }
-            else
-            {
-                bots::placeAtHome(entry->charId);
+                order.push_back(candidate);
             }
         }
 
-        login(*entry);
+        // Below SOLO_BELOW: a starting area, not a town and not a camp somewhere else. 0 keeps the camp / home roll.
+        const auto soloBelow  = settings::get<uint32>("bots.SOLO_BELOW");
+        const auto campChance = settings::get<uint32>("bots.CAMP_CHANCE");
+        for (const auto* chosen : order)
+        {
+            if (!bots::claimBot(chosen->charId))
+            {
+                continue;
+            }
+
+            if (soloBelow > 0 && chosen->level < soloBelow)
+            {
+                if (const auto place = bots::soloPlace(chosen->level, charNation(chosen->charId)))
+                {
+                    bots::placeAt(chosen->charId, *place);
+                    ShowInfoFmt("bots: {} solos in {} (level {})", chosen->name, zoneText(place->zone), static_cast<int>(chosen->level));
+                }
+                else if (bots::splitMode() && !bots::zoneLocal(bots::charZone(chosen->charId)))
+                {
+                    bots::releaseBot(chosen->charId);
+                    continue;
+                }
+                else
+                {
+                    ShowWarningFmt("bots: no starting area for {} (level {}); left where they were", chosen->name, static_cast<int>(chosen->level));
+                }
+            }
+            else
+            {
+                // Most go out to a camp for their level; the rest start at their pool home.
+                // A home on another map is not a login zone: use a local camp, or leave them for that map.
+                const auto camps    = bots::findCamps(chosen->level);
+                const bool homeHere = !bots::splitMode() || bots::zoneLocal(bots::homeZone(chosen->charId));
+                const bool campRoll = !camps.empty() && xirand::GetRandomNumber<uint32>(100) < campChance;
+                if (campRoll || !homeHere)
+                {
+                    if (!camps.empty())
+                    {
+                        const auto& camp = camps[xirand::GetRandomNumber<std::size_t>(camps.size())];
+                        bots::placeAt(chosen->charId, { camp.zone, bots::spotNear(camp.zone, camp.pos, 5.0f, 25.0f) });
+                    }
+                    else if (homeHere)
+                    {
+                        bots::placeAtHome(chosen->charId);
+                    }
+                    else
+                    {
+                        bots::releaseBot(chosen->charId);
+                        continue;
+                    }
+                }
+                else
+                {
+                    bots::placeAtHome(chosen->charId);
+                }
+            }
+
+            login(*chosen);
+            return;
+        }
     }
 
     // A recruiting party invites one bot at a time: same zone first, then an idle bot in another zone.
@@ -1554,7 +1637,8 @@ class BotModule : public CPPModule
         const auto soloBelow = settings::get<uint32>("bots.SOLO_BELOW");
         // A bot under SOLO_BELOW is out leveling. Don't log it into a player's zone or haul it out of a starting area.
         const auto leveling = [&](const auto level) { return soloBelow > 0 && static_cast<uint32>(level) < soloBelow; };
-        const bool citizenWaiting = std::ranges::any_of(pool_, [&](const auto& entry) { return citizens.contains(entry.charId) && available(entry); });
+        const bool citizenWaiting = bots::zoneLocal(static_cast<xi::ZoneId>(settings::get<uint32>("bots.CITIZEN_ZONE"))) &&
+                                    std::ranges::any_of(pool_, [&](const auto& entry) { return citizens.contains(entry.charId) && available(entry); });
 
         for (const auto& [zone, players] : zones)
         {
@@ -1590,7 +1674,7 @@ class BotModule : public CPPModule
                 return std::abs(static_cast<int>(level) - static_cast<int>(players.level));
             };
 
-            if (!citizenWaiting && online_.size() < settings::get<uint32>("bots.MAX_ONLINE"))
+            if (!citizenWaiting && online_.size() < bots::localOnlineCap())
             {
                 const bots::PoolEntry* best = nullptr;
                 for (const auto& entry : pool_)
@@ -1602,7 +1686,7 @@ class BotModule : public CPPModule
                 }
 
                 // Closest pool level is still too far: leave the zone under-filled rather than send them.
-                if (best != nullptr && gap(best->level) <= window)
+                if (best != nullptr && gap(best->level) <= window && bots::claimBot(best->charId))
                 {
                     bots::placeAt(best->charId, place);
                     login(*best);
@@ -1633,6 +1717,11 @@ class BotModule : public CPPModule
     {
         const auto* entry = &entry_;
 
+        if (!bots::claimBot(entry->charId))
+        {
+            return;
+        }
+
         bots::Bot bot{
             .charId = entry->charId,
             .accId  = entry->accId,
@@ -1656,6 +1745,7 @@ class BotModule : public CPPModule
         if (!enterZone(bot))
         {
             db::preparedStmt("DELETE FROM accounts_sessions WHERE charid = ?", bot.charId);
+            bots::releaseBot(bot.charId);
             return;
         }
 
@@ -1769,6 +1859,126 @@ class BotModule : public CPPModule
         return true;
     }
 
+    // The destination map logs this bot back in. The party row stays: status is not Shutdown, so
+    // removeCharFromZone does not drop it, and destroying the character only pops the in-memory member.
+    auto handoff(bots::Bot& bot, const xi::ZoneId zone, const position_t& pos) -> bool
+    {
+        auto* PChar = bot.entity();
+        if (PChar == nullptr)
+        {
+            return false;
+        }
+
+        // Published only after this process has dropped the session, so the other map cannot log them in twice.
+        const auto toPort = bots::zonePort(zone);
+        if (toPort == 0 || toPort == bots::mapPort())
+        {
+            ShowErrorFmt("bots: could not hand {} to map {} (zone {})", bot.name, toPort, static_cast<uint16>(zone));
+            return false;
+        }
+
+        PChar->loc.p           = pos;
+        PChar->loc.destination = zone;
+        PChar->m_moghouseID    = 0;
+        if (PChar->status != xi::Status::Disappear)
+        {
+            charutils::SaveCharPosition(PChar);
+        }
+
+        if (const auto entry = std::ranges::find(pool_, bot.charId, &bots::PoolEntry::charId); entry != pool_.end())
+        {
+            entry->level = PChar->GetMLevel();
+        }
+
+        if (PChar->PPet != nullptr && PChar->PPet->objtype == TYPE_MOB)
+        {
+            petutils::DespawnPet(PChar);
+        }
+
+        const auto prev = PChar->loc.zone != nullptr ? PChar->getZone() : zone;
+        // Not Shutdown: a logout would delete the party row. Zoning keeps it for the other map.
+        if (PChar->loc.zone != nullptr)
+        {
+            charutils::removeCharFromZone(PChar);
+        }
+
+        db::preparedStmt("UPDATE chars SET pos_zone = ?, pos_prevzone = ?, pos_x = ?, pos_y = ?, pos_z = ?, pos_rot = ?, moghouse = 0, boundary = 0 "
+                         "WHERE charid = ?",
+                         zone, prev, pos.x, pos.y, pos.z, pos.rotation, bot.charId);
+
+        bots::breakCamp(PChar);
+        bots::dropOuting(bot.charId);
+        bool keepRecruit = false;
+        if (PChar->PParty != nullptr && bots::recruitByLeader(bot.charId) != nullptr)
+        {
+            for (const auto* PMember : PChar->PParty->members)
+            {
+                if (PMember != PChar && PMember->objtype == TYPE_PC && bots::isPoolChar(PMember->id))
+                {
+                    keepRecruit = true;
+                    break;
+                }
+            }
+            if (keepRecruit)
+            {
+                if (auto* rec = bots::recruitByLeader(bot.charId); rec != nullptr && rec->partyId == 0)
+                {
+                    rec->partyId = PChar->PParty->GetPartyID();
+                }
+            }
+        }
+        if (!keepRecruit)
+        {
+            bots::dropRecruit(bot.charId);
+        }
+
+        bots::noteLastSeen(bot);
+        db::preparedStmt("DELETE FROM accounts_sessions WHERE charid = ?", bot.charId);
+        bot.session->PChar.reset();
+
+        if (!bots::noteHandoff(bot.charId, zone, toPort))
+        {
+            // Already gone from this map. Drop the claim so the destination can log them in from the saved position.
+            ShowErrorFmt("bots: could not hand {} to map {} (zone {})", bot.name, toPort, static_cast<uint16>(zone));
+            bots::releaseBot(bot.charId);
+            return true;
+        }
+
+        ShowInfoFmt("bots: {} handed to map {} (zone {})", bot.name, toPort, static_cast<uint16>(zone));
+        return true;
+    }
+
+    // Handoffs aimed at a zone this process runs, and ones nobody took within 60 seconds.
+    void pollHandoffs()
+    {
+        bots::expireHandoffs();
+        for (const auto& arrival : bots::listArrivals())
+        {
+            if (isOnline(arrival.charId))
+            {
+                continue;
+            }
+            if (!bots::claimArrival(arrival.charId, arrival.zone))
+            {
+                continue;
+            }
+
+            ShowInfoFmt("bots: {} arrived from map {} (zone {})", arrival.name, arrival.fromPort, static_cast<uint16>(arrival.zone));
+            login(bots::PoolEntry{
+                .name   = arrival.name,
+                .charId = arrival.charId,
+                .accId  = arrival.accId,
+                .job    = arrival.job,
+                .level  = arrival.level,
+            });
+            if (const auto bot = std::ranges::find_if(online_, [&](const bots::Bot& candidate) { return candidate.charId == arrival.charId; });
+                bot != online_.end())
+            {
+                bot->arrivedAt = timer::now();
+            }
+        }
+    }
+
     // Mirrors the session cleanup a timed-out client gets.
     // force is the failed zone-in path: the character never finished arriving, so it cannot wait out a cutscene.
     void logout(bots::Bot& bot, const bool force = false)
@@ -1830,6 +2040,7 @@ class BotModule : public CPPModule
         }
 
         bots::noteLastSeen(bot);
+        bots::releaseBot(bot.charId);
         db::preparedStmt("DELETE FROM accounts_sessions WHERE charid = ?", bot.charId);
         bot.session->PChar.reset();
 
@@ -1991,6 +2202,7 @@ class BotModule : public CPPModule
     timer::time_point             nextBalance_{};
     timer::time_point             nextGrouping_{};
     timer::time_point             nextSeek_{};
+    timer::time_point             nextHandoff_{};
     struct DueInvite
     {
         uint32            charId{};

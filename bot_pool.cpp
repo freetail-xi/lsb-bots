@@ -10,7 +10,10 @@
 #include "common/xirand.h"
 
 #include "map/entities/char_entity.h"
+#include "map/map_engine.h"
 #include "map/utils/charutils.h"
+#include "map/utils/zoneutils.h"
+#include "map/zone.h"
 
 #include <algorithm>
 #include <array>
@@ -19,6 +22,7 @@
 #include <ctime>
 #include <deque>
 #include <map>
+#include <set>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -194,6 +198,11 @@ void ensureSchema()
     db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS diary text NULL AFTER chattiness");
     db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS last_seen int(10) unsigned NULL AFTER diary");
     db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS play_style tinyint(3) unsigned NULL AFTER last_seen");
+    // Which map process currently has this bot, and a zone change onto a map this process doesn't run.
+    db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS owner_port smallint(5) unsigned NOT NULL DEFAULT 0 AFTER play_style");
+    db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS handoff_zone smallint(3) unsigned NOT NULL DEFAULT 0 AFTER owner_port");
+    db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS handoff_at int(10) unsigned NOT NULL DEFAULT 0 AFTER handoff_zone");
+    db::preparedStmt("ALTER TABLE bot_pool ADD COLUMN IF NOT EXISTS handoff_from smallint(5) unsigned NOT NULL DEFAULT 0 AFTER handoff_at");
 }
 
 namespace
@@ -240,11 +249,367 @@ auto loadPool() -> std::vector<PoolEntry>
     return pool;
 }
 
-// A crashed map server leaves bot sessions and party rows behind.
-void clearStaleState()
+namespace
 {
-    db::preparedStmt("DELETE s FROM accounts_sessions s JOIN bot_pool b ON b.charid = s.charid");
-    db::preparedStmt("DELETE p FROM accounts_parties p JOIN bot_pool b ON b.charid = p.charid");
+
+// Set by prepareSplit. When split_ is false every helper below is a no-op and zoneLocal is true,
+// so a single map process does not claim, hand off, or shrink the cap.
+bool                 split_      = false;
+uint16               port_       = 0;
+uint32               localCount_ = 0;
+uint32               allCount_   = 0;
+std::set<xi::ZoneId> localZones_;
+std::vector<Handoff> handoffs_;
+
+constexpr uint32 kHandoffSeconds = 60;
+
+auto unixNow() -> uint32
+{
+    return static_cast<uint32>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+} // namespace
+
+auto prepareSplit() -> MapSplit
+{
+    localZones_.clear();
+    handoffs_.clear();
+    split_      = false;
+    port_       = 0;
+    localCount_ = 0;
+    allCount_   = 0;
+
+    uint16 seenPort = 0;
+    bool   mixed    = false;
+    const auto note = [&](const uint16 port)
+    {
+        if (port == 0)
+        {
+            return;
+        }
+        if (seenPort == 0)
+        {
+            seenPort = port;
+        }
+        else if (port != seenPort)
+        {
+            mixed = true;
+        }
+    };
+
+    for (auto& [zoneId, PZone] : g_PZoneList)
+    {
+        localZones_.insert(zoneId);
+        if (PZone != nullptr)
+        {
+            note(PZone->GetPort());
+        }
+    }
+    for (const auto& [zoneId, name] : zoneutils::GetManagedZones())
+    {
+        (void)name;
+        localZones_.insert(zoneId);
+    }
+
+    // zoneport for zones that are assigned but not loaded yet (lazy). Loaded zones already noted GetPort().
+    if (const auto rset = db::preparedStmt("SELECT zoneid, zoneport FROM zone_settings"))
+    {
+        while (rset->next())
+        {
+            const auto zoneId = rset->get<xi::ZoneId>("zoneid");
+            if (localZones_.contains(zoneId))
+            {
+                note(rset->get<uint16>("zoneport"));
+            }
+        }
+    }
+
+    // IP 0 returns every zone_settings row. This process serves every zone when it holds that whole list.
+    const auto all = zoneutils::GetZonesAssignedToThisProcess(IPP(0, 0));
+    allCount_      = static_cast<uint32>(all.size());
+    localCount_    = static_cast<uint32>(localZones_.size());
+    const bool servesEvery = allCount_ > 0 && localCount_ >= allCount_;
+
+    uint32 endpoints = 0;
+    if (const auto rset = db::preparedStmt("SELECT COUNT(*) AS n FROM (SELECT zoneip, zoneport FROM zone_settings GROUP BY zoneip, zoneport) endpoints"))
+    {
+        if (rset->next())
+        {
+            endpoints = rset->get<uint32>("n");
+        }
+    }
+
+    // One zoneport across the zones we serve. Mixed ports means --ip 0 loaded every zone (single process).
+    if (!mixed)
+    {
+        port_ = seenPort;
+    }
+    split_ = !servesEvery && endpoints > 1 && port_ != 0;
+
+    uint32 botZones = 0;
+    if (const auto rset = db::preparedStmt("SELECT DISTINCT c.pos_zone AS z FROM bot_pool b "
+                                           "JOIN chars c ON c.charid = b.charid WHERE b.enabled = 1 AND b.charid <> 0"))
+    {
+        while (rset->next())
+        {
+            if (localZones_.contains(rset->get<xi::ZoneId>("z")))
+            {
+                ++botZones;
+            }
+        }
+    }
+
+    const auto logPort = port_ != 0 ? port_ : settings::get<uint16>("network.MAP_PORT");
+    return MapSplit{
+        .split      = split_,
+        .port       = logPort,
+        .zones      = localCount_,
+        .botZones   = botZones,
+        .processes  = endpoints,
+    };
+}
+
+auto splitMode() -> bool
+{
+    return split_;
+}
+
+auto mapPort() -> uint16
+{
+    return port_;
+}
+
+auto zoneLocal(const xi::ZoneId zone) -> bool
+{
+    return !split_ || localZones_.contains(zone);
+}
+
+auto zonePort(const xi::ZoneId zone) -> uint16
+{
+    const auto ipp = IPP(zoneutils::GetZoneIPP(zone));
+    return ipp.getPort();
+}
+
+auto localOnlineCap() -> uint32
+{
+    const auto cap = settings::get<uint32>("bots.MAX_ONLINE");
+    if (!split_ || allCount_ == 0)
+    {
+        return cap;
+    }
+
+    // This process's share of the pool, by how many zones it serves. A small share still logs one bot in.
+    auto share = static_cast<uint32>((static_cast<uint64>(cap) * localCount_ + allCount_ / 2) / allCount_);
+    if (share == 0 && cap > 0 && localCount_ > 0)
+    {
+        share = 1;
+    }
+    return share;
+}
+
+auto homeZone(const uint32 charId) -> xi::ZoneId
+{
+    const auto rset = db::preparedStmt("SELECT zone AS z FROM bot_pool WHERE charid = ? LIMIT 1", charId);
+    if (rset && rset->next())
+    {
+        return rset->get<xi::ZoneId>("z");
+    }
+    return xi::ZoneId{};
+}
+
+auto charZone(const uint32 charId) -> xi::ZoneId
+{
+    const auto rset = db::preparedStmt("SELECT pos_zone AS z FROM chars WHERE charid = ? LIMIT 1", charId);
+    if (rset && rset->next())
+    {
+        return rset->get<xi::ZoneId>("z");
+    }
+    return xi::ZoneId{};
+}
+
+auto claimBot(const uint32 charId) -> bool
+{
+    if (!split_)
+    {
+        return true;
+    }
+
+    // Changed rows only: already owning the bot updates nothing, so the SELECT confirms it.
+    const auto updated = db::preparedStmt("UPDATE bot_pool SET owner_port = ? WHERE charid = ? AND owner_port IN (0, ?) AND handoff_zone = 0",
+                                          port_, charId, port_);
+    if (updated && updated->rowsAffected() > 0)
+    {
+        return true;
+    }
+
+    const auto rset = db::preparedStmt("SELECT owner_port, handoff_zone FROM bot_pool WHERE charid = ? LIMIT 1", charId);
+    if (rset && rset->next())
+    {
+        return rset->get<uint16>("owner_port") == port_ && rset->get<uint16>("handoff_zone") == 0;
+    }
+    return false;
+}
+
+void releaseBot(const uint32 charId)
+{
+    if (!split_)
+    {
+        return;
+    }
+
+    db::preparedStmt("UPDATE bot_pool SET owner_port = 0 WHERE charid = ? AND owner_port = ? AND handoff_zone = 0", charId, port_);
+}
+
+auto noteHandoff(const uint32 charId, const xi::ZoneId zone, const uint16 toPort) -> bool
+{
+    if (!split_ || toPort == 0 || toPort == port_)
+    {
+        return false;
+    }
+
+    const auto updated = db::preparedStmt("UPDATE bot_pool SET owner_port = ?, handoff_zone = ?, handoff_at = ?, handoff_from = ? "
+                                          "WHERE charid = ? AND owner_port = ?",
+                                          toPort, zone, unixNow(), port_, charId, port_);
+    return updated && updated->rowsAffected() > 0;
+}
+
+void queueHandoff(const uint32 charId, const xi::ZoneId zone, const position_t& pos)
+{
+    if (!split_)
+    {
+        return;
+    }
+
+    for (auto& row : handoffs_)
+    {
+        if (row.charId == charId)
+        {
+            row.zone = zone;
+            row.pos  = pos;
+            return;
+        }
+    }
+    handoffs_.push_back(Handoff{ charId, zone, pos });
+}
+
+auto takeHandoffs() -> std::vector<Handoff>
+{
+    std::vector<Handoff> out;
+    out.swap(handoffs_);
+    return out;
+}
+
+void expireHandoffs()
+{
+    if (!split_)
+    {
+        return;
+    }
+
+    const auto now = unixNow();
+    if (now < kHandoffSeconds)
+    {
+        return;
+    }
+    const auto cutoff = now - kHandoffSeconds;
+
+    const auto rset = db::preparedStmt("SELECT charid, name, handoff_zone FROM bot_pool "
+                                       "WHERE handoff_zone <> 0 AND handoff_at > 0 AND handoff_at < ?",
+                                       cutoff);
+    if (!rset)
+    {
+        return;
+    }
+
+    while (rset->next())
+    {
+        const auto charId = rset->get<uint32>("charid");
+        const auto name   = rset->get<std::string>("name");
+        const auto zone   = rset->get<uint16>("handoff_zone");
+        const auto updated = db::preparedStmt("UPDATE bot_pool SET owner_port = 0, handoff_zone = 0, handoff_at = 0, handoff_from = 0 "
+                                              "WHERE charid = ? AND handoff_zone <> 0 AND handoff_at > 0 AND handoff_at < ?",
+                                              charId, cutoff);
+        if (updated && updated->rowsAffected() > 0)
+        {
+            ShowInfoFmt("bots: {} handoff expired (zone {}); back in the pool", name, zone);
+        }
+    }
+}
+
+auto listArrivals() -> std::vector<Arrival>
+{
+    std::vector<Arrival> rows;
+    if (!split_)
+    {
+        return rows;
+    }
+
+    const auto now = unixNow();
+    const auto cutoff = now >= kHandoffSeconds ? now - kHandoffSeconds : 0;
+    const auto rset = db::preparedStmt("SELECT b.name, b.charid, b.accid, b.handoff_zone, b.handoff_from, s.mjob, GREATEST(s.mlvl, b.level) AS mlvl "
+                                       "FROM bot_pool b "
+                                       "JOIN chars c ON c.charid = b.charid "
+                                       "JOIN char_stats s ON s.charid = b.charid "
+                                       "WHERE b.enabled = 1 AND b.handoff_zone <> 0 AND b.handoff_at >= ?",
+                                       cutoff);
+    if (!rset)
+    {
+        return rows;
+    }
+
+    while (rset->next())
+    {
+        const auto zone = rset->get<xi::ZoneId>("handoff_zone");
+        if (!localZones_.contains(zone))
+        {
+            continue;
+        }
+        rows.push_back(Arrival{
+            .charId   = rset->get<uint32>("charid"),
+            .accId    = rset->get<uint32>("accid"),
+            .name     = rset->get<std::string>("name"),
+            .job      = rset->get<uint8>("mjob"),
+            .level    = rset->get<uint8>("mlvl"),
+            .zone     = zone,
+            .fromPort = rset->get<uint16>("handoff_from"),
+        });
+    }
+    return rows;
+}
+
+auto claimArrival(const uint32 charId, const xi::ZoneId zone) -> bool
+{
+    if (!split_)
+    {
+        return false;
+    }
+
+    // handoff_zone changes, so a row we already own still counts as affected. Another map's claim does not match.
+    const auto updated = db::preparedStmt("UPDATE bot_pool SET owner_port = ?, handoff_zone = 0, handoff_at = 0, handoff_from = 0 "
+                                          "WHERE charid = ? AND handoff_zone = ? AND owner_port IN (0, ?)",
+                                          port_, charId, zone, port_);
+    return updated && updated->rowsAffected() > 0;
+}
+
+// A crashed map server leaves bot sessions and party rows behind.
+// One process: every bot, as before. Split: only rows for this process's port.
+void clearStaleState(const uint16 port, const bool split)
+{
+    if (!split)
+    {
+        db::preparedStmt("DELETE s FROM accounts_sessions s JOIN bot_pool b ON b.charid = s.charid");
+        db::preparedStmt("DELETE p FROM accounts_parties p JOIN bot_pool b ON b.charid = p.charid");
+        return;
+    }
+
+    db::preparedStmt("DELETE s FROM accounts_sessions s JOIN bot_pool b ON b.charid = s.charid WHERE s.server_port = ?", port);
+    // owner_port 0 with no session is a leftover from before the column existed, or a logout that kept a party row.
+    // A bot online on another map has a session, or already has that map's port, and is left alone.
+    db::preparedStmt("DELETE p FROM accounts_parties p JOIN bot_pool b ON b.charid = p.charid "
+                     "LEFT JOIN accounts_sessions s ON s.charid = p.charid "
+                     "WHERE b.owner_port = ? OR (b.owner_port = 0 AND s.charid IS NULL)",
+                     port);
+    db::preparedStmt("UPDATE bot_pool SET owner_port = 0, handoff_zone = 0, handoff_at = 0, handoff_from = 0 WHERE owner_port = ?", port);
 }
 
 auto countRealPlayers() -> uint32

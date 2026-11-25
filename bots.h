@@ -226,6 +226,8 @@ struct Bot
     uint32                      assistId{};      // told to fight this party member's target instead of the leader's
     timer::time_point           foughtAt{};      // last tick it was in a fight
     timer::time_point           playerGoneAt{};  // when its party last had no real player in it
+    timer::time_point           leaderAwayAt{};  // party leader not on this map since; leave after a wait
+    timer::time_point           arrivedAt{};     // logged in from a handoff; the cap waits before dropping them
     timer::time_point           nextChatter{};   // when it may next start a conversation
     timer::time_point           nextHunt{};      // when a bot on its own next looks for something to fight
     timer::time_point           preyDrySince{};  // solo under SOLO_BELOW: nothing in hunt range since this; unset starts the clock
@@ -311,10 +313,56 @@ inline auto saysPhrase(const std::string& text, const std::initializer_list<std:
     return false;
 }
 
+// One row this process still has to log out and hand to the map that runs `zone`.
+struct Handoff
+{
+    uint32     charId{};
+    xi::ZoneId zone{};
+    position_t pos{};
+};
+
+// A bot whose handoff zone is one this process runs. `fromPort` is the map that sent them.
+struct Arrival
+{
+    uint32      charId{};
+    uint32      accId{};
+    std::string name;
+    uint8       job{};
+    uint8       level{};
+    xi::ZoneId  zone{};
+    uint16      fromPort{};
+};
+
+// What prepareSplit decided. `port` is this process's zone port (the log line). `split` is false on one map.
+struct MapSplit
+{
+    bool   split{};
+    uint16 port{};
+    uint32 zones{};
+    uint32 botZones{}; // local zones that currently have a pool bot saved in them
+    uint32 processes{};
+};
+
 // bot_pool.cpp
 void ensureSchema();
 auto loadPool() -> std::vector<PoolEntry>;
-void clearStaleState();
+auto prepareSplit() -> MapSplit;                 // call once at startup, before clearStaleState
+void clearStaleState(uint16 port, bool split);   // split: only this port's sessions, parties and claims
+auto splitMode() -> bool;
+auto mapPort() -> uint16;
+auto zoneLocal(xi::ZoneId zone) -> bool;         // true for every zone when this process is not split
+auto zonePort(xi::ZoneId zone) -> uint16;        // zone_settings.zoneport, 0 when the zone is unknown
+auto localOnlineCap() -> uint32;                 // MAX_ONLINE, or this process's share of it when split
+auto homeZone(uint32 charId) -> xi::ZoneId;      // bot_pool.zone
+auto charZone(uint32 charId) -> xi::ZoneId;      // chars.pos_zone
+auto claimBot(uint32 charId) -> bool;            // owner_port, only when nobody (or we) hold it and no handoff is open
+void releaseBot(uint32 charId);                  // owner_port back to 0; no-op when not split
+auto noteHandoff(uint32 charId, xi::ZoneId zone, uint16 toPort) -> bool;
+void queueHandoff(uint32 charId, xi::ZoneId zone, const position_t& pos);
+auto takeHandoffs() -> std::vector<Handoff>;
+void expireHandoffs();                           // 60s with nobody picking the row up: back to the pool
+auto listArrivals() -> std::vector<Arrival>;
+auto claimArrival(uint32 charId, xi::ZoneId zone) -> bool;
 auto countRealPlayers() -> uint32;
 void registerPoolChar(uint32 charId);
 auto isPoolChar(uint32 charId) -> bool;

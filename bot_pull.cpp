@@ -1212,6 +1212,10 @@ auto pullReport(CCharEntity* PPuller) -> std::string
 // The caller asks once the party is together and fit; true while the party is camped.
 auto autoCamp(CCharEntity* PLeader, const bool withPlayer) -> bool
 {
+    if (PLeader == nullptr || PLeader->loc.zone == nullptr)
+    {
+        return false;
+    }
     if (pullFor(PLeader) != nullptr)
     {
         return campSpot(PLeader).has_value();
