@@ -969,10 +969,12 @@ void endHeadOut(Bot& bot, CCharEntity* PChar)
 // A member of a party already walking out copies the leader's camp onto the return path.
 void joinOuting(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, const timer::time_point tick)
 {
-    if (bot.returnUntil != timer::time_point{} || bot.nextHeadOut > tick || !partyIsBots(bot, PChar, botIds) || PChar->PParty->GetLeader() == PChar)
+    if (bot.returnUntil != timer::time_point{} || bot.nextHeadOut > tick || !partyIsBots(bot, PChar, botIds) || PChar->PParty->GetLeader() == nullptr ||
+        PChar->PParty->GetLeader() == PChar)
     {
         return;
     }
+    // The leader is null for a tick after a leading bot's session ends (issue #5).
     const auto it = outings.find(PChar->PParty->GetLeader()->id);
     if (it == outings.end() || tick >= it->second.until)
     {
