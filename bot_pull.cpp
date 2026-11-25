@@ -862,6 +862,10 @@ auto pullStatus(const CCharEntity* PChar) -> std::string
 // Naming a puller keeps the camp (only "camp here" moves it), and naming the one already pulling changes nothing.
 void setPuller(CBattleEntity* PLeader, const uint32 pullerId)
 {
+    if (PLeader == nullptr) // a party between leaders, e.g. right after a leading bot logs out (issue #5)
+    {
+        return;
+    }
     const auto it = pulls.find(PLeader->id);
     if (it != pulls.end() && it->second.zone == PLeader->getZone())
     {
@@ -886,6 +890,10 @@ void setPuller(CBattleEntity* PLeader, const uint32 pullerId)
 
 void stopPulling(CBattleEntity* PLeader)
 {
+    if (PLeader == nullptr)
+    {
+        return;
+    }
     if (const auto it = pulls.find(PLeader->id); it != pulls.end())
     {
         it->second.pullerId = 0;
@@ -895,6 +903,10 @@ void stopPulling(CBattleEntity* PLeader)
 
 void setCamp(CBattleEntity* PLeader)
 {
+    if (PLeader == nullptr)
+    {
+        return;
+    }
     auto& pull = pulls[PLeader->id];
     pull.zone  = PLeader->getZone();
     pull.camp  = PLeader->loc.p;
@@ -903,6 +915,10 @@ void setCamp(CBattleEntity* PLeader)
 
 void breakCamp(CBattleEntity* PLeader)
 {
+    if (PLeader == nullptr)
+    {
+        return;
+    }
     pulls.erase(PLeader->id);
     choices.erase(PLeader->id);
 }
