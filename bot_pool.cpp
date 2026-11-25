@@ -108,13 +108,6 @@ auto createCharacter(const std::string& name) -> bool
         return false;
     }
 
-    // Geomancer and Rune Fencer aren't part of this server's era.
-    if (jobColumns[job] == "geo" || jobColumns[job] == "run")
-    {
-        ShowErrorFmt("bots: {} has job {}, which this server doesn't use", name, jobColumns[job]);
-        return false;
-    }
-
     if (nameTaken(name))
     {
         ShowErrorFmt("bots: the name {} is already taken by another character", name);
