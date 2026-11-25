@@ -918,27 +918,36 @@ class BotModule : public CPPModule
         };
 
         // An open party's current band. A full party is not still taking people.
+        // Worked out once per leader per pass: held() asks this for every candidate, for every recruiting party.
+        struct Band
+        {
+            bool open{};
+            int  lo{};
+            int  hi{};
+        };
+        std::map<uint32, Band> bands;
         const auto couldTake = [&](const bots::PartyRecruit& row, const int level) -> bool
         {
-            const auto leader = std::ranges::find_if(online_, [&](const bots::Bot& bot) { return bot.charId == row.leaderId; });
-            int        lo     = static_cast<int>(row.center);
-            int        hi     = lo;
-            if (leader != online_.end() && leader->entity() != nullptr && leader->entity()->PParty != nullptr)
+            auto found = bands.find(row.leaderId);
+            if (found == bands.end())
             {
-                auto* PParty = leader->entity()->PParty;
-                if (PParty->IsFull() || PParty->members.size() >= 6)
+                Band       band{ true, static_cast<int>(row.center), static_cast<int>(row.center) };
+                const auto leader = std::ranges::find_if(online_, [&](const bots::Bot& bot) { return bot.charId == row.leaderId; });
+                if (leader != online_.end() && leader->entity() != nullptr && leader->entity()->PParty != nullptr)
                 {
-                    return false;
+                    auto* PParty = leader->entity()->PParty;
+                    band.open    = !(PParty->IsFull() || PParty->members.size() >= 6);
+                    band.lo      = 255;
+                    band.hi      = 0;
+                    for (const auto* PMember : PParty->members)
+                    {
+                        band.lo = std::min(band.lo, static_cast<int>(PMember->GetMLevel()));
+                        band.hi = std::max(band.hi, static_cast<int>(PMember->GetMLevel()));
+                    }
                 }
-                lo = 255;
-                hi = 0;
-                for (const auto* PMember : PParty->members)
-                {
-                    lo = std::min(lo, static_cast<int>(PMember->GetMLevel()));
-                    hi = std::max(hi, static_cast<int>(PMember->GetMLevel()));
-                }
+                found = bands.emplace(row.leaderId, band).first;
             }
-            return bots::fitsBand(static_cast<int>(row.center), lo, hi, level);
+            return found->second.open && bots::fitsBand(static_cast<int>(row.center), found->second.lo, found->second.hi, level);
         };
         // Same zone as this bot, and that party would still invite them. Left for it, not pulled across zones.
         const auto held = [&](const bots::Bot& candidate, const uint32 exceptId) -> bool

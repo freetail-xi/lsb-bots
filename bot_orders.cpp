@@ -283,7 +283,20 @@ auto preference(const Job job, const uint8 level, const OrderKind kind) -> int
 auto isHeadOutLine(const std::string& text) -> bool
 {
     const auto t = lowered(text);
-    return saysAny(t, { "head out", "lets head out", "let's head out", "go to camp", "lets go camp", "let's go camp", "ready" });
+    if (saysAny(t, { "head out", "lets head out", "let's head out", "go to camp", "lets go camp", "let's go camp" }))
+    {
+        return true;
+    }
+    // "ready" only as the whole line ("ready", "I'm ready!"), so "not ready yet" doesn't send the party.
+    std::string letters;
+    for (const char c : t)
+    {
+        if (std::isalpha(static_cast<unsigned char>(c)))
+        {
+            letters += c;
+        }
+    }
+    return letters == "ready" || letters == "imready" || letters == "wereready" || letters == "readytogo";
 }
 
 // "follow Ysolde", "assist Kakaru": the party member named after the keyword, else the speaker.

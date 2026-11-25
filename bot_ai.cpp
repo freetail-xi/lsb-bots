@@ -1195,6 +1195,7 @@ void startHeadOut(Bot& bot, CCharEntity* PChar, const std::set<uint32>& /*botIds
     if (rec != nullptr)
     {
         rec->campAvg = static_cast<uint8>(average);
+        rec->center  = static_cast<uint8>(std::clamp(average, 1, 75)); // replacements fit the party as it is now
         rec->atCamp  = false;
         rec->depart  = false;
         rec->zone    = camp->zone;
@@ -2538,7 +2539,9 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     }
 
     // Still in the wrong zone for the party being built, or for the camp it is recruiting at. Zone, then walk.
-    if (const auto* rec = recruitFor(PChar); rec != nullptr && PChar->loc.zone != nullptr && PChar->getZone() != rec->zone && !PChar->isDead() && !PChar->isInEvent() &&
+    // Never while walking out or back (returnUntil set): startHeadOut has already set rec->zone to the camp's,
+    // and the walk is the point. Only a walk that hit its cap, or a recruit from elsewhere, is zoned.
+    if (const auto* rec = recruitFor(PChar); rec != nullptr && bot.returnUntil == timer::time_point{} && PChar->loc.zone != nullptr && PChar->getZone() != rec->zone && !PChar->isDead() && !PChar->isInEvent() &&
                                              !(bot.gather && bot.gather->waiting) && PChar->status == xi::Status::Normal)
     {
         const bool attacked = PTarget != nullptr && PTarget->GetBattleTarget() == PChar;
