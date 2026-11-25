@@ -89,7 +89,7 @@ auto preferredSkills(const xi::Job job) -> std::vector<SkillType>
         case xi::Job::DNC: return { SkillType::Dagger };
         case xi::Job::SCH: return { SkillType::Staff };
         case xi::Job::GEO: return { SkillType::Club };
-        case xi::Job::RUN: return { SkillType::GreatSword };
+        case xi::Job::RUN: return { SkillType::GreatSword, SkillType::Sword };
         default: return {};
     }
 }

@@ -1369,12 +1369,18 @@ auto upkeep(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>& 
 
     if (job == Job::GEO && !town && (bot.directives.restraints & kNoBuffs) == 0)
     {
-        // Indi- on itself always: Refresh for a caster-heavy party, else attack, defence, regen, accuracy.
+        // Indi- on itself. Refresh only when someone else spends MP; alone, attack then defence, regen, accuracy,
+        // then the low colures, so a level that doesn't know the first one still casts one it has.
+        const auto othersWithMP = std::ranges::count_if(members, [&](const CBattleEntity* PMember) { return PMember != PChar && PMember->GetMaxMP() > 0; });
         if (!effect(StatusEffect::ColureActive) &&
-            (casters >= 2 ? castBest(bot, packets, { SpellID::Indi_Refresh, SpellID::Indi_Fury, SpellID::Indi_Barrier, SpellID::Indi_Regen, SpellID::Indi_Precision },
-                                     PChar, std::chrono::seconds(10), tick)
-                          : castBest(bot, packets, { SpellID::Indi_Fury, SpellID::Indi_Barrier, SpellID::Indi_Regen, SpellID::Indi_Precision, SpellID::Indi_Refresh },
-                                     PChar, std::chrono::seconds(10), tick)))
+            (othersWithMP > 0 ? castBest(bot, packets,
+                                         { SpellID::Indi_Refresh, SpellID::Indi_Fury, SpellID::Indi_Barrier, SpellID::Indi_Regen, SpellID::Indi_Precision,
+                                           SpellID::Indi_Voidance, SpellID::Indi_Poison },
+                                         PChar, std::chrono::seconds(10), tick)
+                              : castBest(bot, packets,
+                                         { SpellID::Indi_Fury, SpellID::Indi_Barrier, SpellID::Indi_Regen, SpellID::Indi_Precision, SpellID::Indi_Voidance,
+                                           SpellID::Indi_Poison },
+                                         PChar, std::chrono::seconds(10), tick)))
         {
             return true;
         }
@@ -1386,7 +1392,13 @@ auto upkeep(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>& 
         auto* PTank = mainTank(PChar);
         auto* PBy   = PTank != nullptr && std::ranges::find(members, PTank) != members.end() ? PTank : PChar;
         return PChar->PPet == nullptr &&
-               castBest(bot, packets, { SpellID::Geo_Fury, SpellID::Geo_Barrier, SpellID::Geo_Regen, SpellID::Geo_Precision }, PBy, std::chrono::seconds(10), tick);
+               (othersWithMP > 0 ? castBest(bot, packets,
+                                            { SpellID::Geo_Refresh, SpellID::Geo_Fury, SpellID::Geo_Barrier, SpellID::Geo_Regen, SpellID::Geo_Precision,
+                                              SpellID::Geo_Voidance },
+                                            PBy, std::chrono::seconds(10), tick)
+                                 : castBest(bot, packets,
+                                            { SpellID::Geo_Fury, SpellID::Geo_Barrier, SpellID::Geo_Regen, SpellID::Geo_Precision, SpellID::Geo_Voidance },
+                                            PBy, std::chrono::seconds(10), tick));
     }
 
     if ((job != Job::COR && PChar->GetSJob() != Job::COR) || town)
@@ -1591,6 +1603,12 @@ auto pets(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
         return PChar->GetMJob() == Job::SMN && PPet != nullptr && tryAbility(bot, packets, ABILITY_RELEASE, PChar, tick);
     }
 
+    // The luopan is not a jug, an avatar or an automaton. Full Circle is upkeep, and only once the fight is over.
+    if (PChar->GetMJob() == Job::GEO)
+    {
+        return false;
+    }
+
     if (PChar->GetMJob() == Job::DRG)
     {
         return PPet == nullptr && tryAbility(bot, packets, ABILITY_CALL_WYVERN, PChar, tick);
@@ -1736,6 +1754,8 @@ auto grab(Bot& bot, PacketSystem& packets, CBattleEntity* PMob, const timer::tim
     return false;
 }
 
+auto runes(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::time_point tick) -> bool;
+
 auto provokeReady(CBattleEntity* PEntity) -> bool
 {
     auto* PChar    = dynamic_cast<CCharEntity*>(PEntity);
@@ -1761,8 +1781,13 @@ auto tank(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
     }
 
     // The main tank builds a lead with every enmity tool as it comes off cooldown, whoever has the monster right now.
+    // A rune fencer keeps its runes and Vallation up before it spends the action on Provoke.
     if (mainTank(PChar) == PChar)
     {
+        if (runes(bot, packets, PTarget, tick))
+        {
+            return true;
+        }
         if (tryAbility(bot, packets, ABILITY_PROVOKE, PTarget, tick))
         {
             if (PVictim != nullptr && PVictim != PChar)
@@ -1795,6 +1820,7 @@ auto tank(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
         return true;
     }
     return tryCast(bot, packets, SpellID::Flash, PTarget, std::chrono::seconds(5), tick) ||
+           tryCast(bot, packets, SpellID::Foil, PChar, std::chrono::seconds(10), tick) ||
            tryAbility(bot, packets, ABILITY_SHIELD_BASH, PTarget, tick);
 }
 
@@ -1868,8 +1894,8 @@ auto mainTank(CCharEntity* PChar) -> CBattleEntity*
     return PBest;
 }
 
-// Whom the party leans on for cures: its White Mage, else a Red Mage or Scholar; the higher level breaks a tie. A trust
-// only when no player or bot heals, since trusts don't answer a call for cures.
+// Whom the party leans on for cures: its White Mage, else a Red Mage or Scholar, else a Geomancer / White Mage; the
+// higher level breaks a tie. A trust only when no player or bot heals, since trusts don't answer a call for cures.
 auto partyHealer(CCharEntity* PChar) -> CBattleEntity*
 {
     if (PChar->PParty == nullptr)
@@ -1880,7 +1906,20 @@ auto partyHealer(CCharEntity* PChar) -> CBattleEntity*
     const auto rank = [](const CBattleEntity* PMember)
     {
         const auto job = PMember->GetMJob();
-        return std::tuple(PMember->objtype != TYPE_TRUST, job == Job::WHM ? 2 : job == Job::RDM || job == Job::SCH ? 1 : 0, PMember->GetMLevel());
+        int        place = 0;
+        if (job == Job::WHM)
+        {
+            place = 3;
+        }
+        else if (job == Job::RDM || job == Job::SCH)
+        {
+            place = 2;
+        }
+        else if (job == Job::GEO && PMember->GetSJob() == Job::WHM)
+        {
+            place = 1;
+        }
+        return std::tuple(PMember->objtype != TYPE_TRUST, place, PMember->GetMLevel());
     };
 
     CBattleEntity* PBest = nullptr;
@@ -2005,7 +2044,8 @@ auto healingWanted(CCharEntity* PChar) -> bool
         return false;
     }
 
-    const uint8 threshold = job == Job::WHM ? kWhmCureHPP : job == Job::RDM || job == Job::SCH ? 60 : kEmergencyHPP;
+    const bool  geoHeals  = job == Job::GEO && PChar->GetSJob() == Job::WHM && !partyHas(PChar, Job::WHM) && !partyHas(PChar, Job::RDM) && !partyHas(PChar, Job::SCH);
+    const uint8 threshold = job == Job::WHM ? kWhmCureHPP : job == Job::RDM || job == Job::SCH || geoHeals ? 60 : kEmergencyHPP;
     const bool  raises    = spell::CanUseSpell(PChar, SpellID::Raise) || spell::CanUseSpell(PChar, SpellID::Raise_II);
     return std::ranges::any_of(partyMembersAll(PChar),
                                [&](CBattleEntity* PMember)
@@ -2105,34 +2145,44 @@ auto waltz(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>& m
     return std::ranges::any_of(waltzes, [&](const auto& w) { return PChar->health.tp >= w.second && tryAbility(bot, packets, w.first, PHurt, tick); });
 }
 
-// Rune Fencer: as many runes as it can hold, Swordplay, and Vallation, Valiance or Pflug while it takes the hits.
+// Rune Fencer: as many runes as it can hold, then Swordplay, Vallation, Valiance, Pflug, Battuta, Liement or One for All
+// while it takes the hits. No weakness is stored on a monster here, so the eight runes rotate and are not all one element.
 auto runes(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::time_point tick) -> bool
 {
     auto* PChar = bot.entity();
-    if (PChar->GetMJob() != Job::RUN)
+    if (PChar->GetMJob() != Job::RUN || PTarget == nullptr)
     {
         return false;
     }
 
-    const auto held = std::ranges::count_if(std::array{ StatusEffect::Ignis, StatusEffect::Gelus, StatusEffect::Flabra, StatusEffect::Tellus, StatusEffect::Sulpor,
-                                                        StatusEffect::Unda, StatusEffect::Lux, StatusEffect::Tenebrae },
-                                            [&](const StatusEffect effect) { return PChar->StatusEffectContainer->HasStatusEffect(effect); });
+    // Each rune is its own effect, including two of one element. HasStatusEffect would count that as one.
+    const auto held = PChar->StatusEffectContainer->GetStatusEffectCountInIDRange(StatusEffect::Ignis, StatusEffect::Tenebrae);
     const auto most = PChar->GetMLevel() >= 65 ? 3 : PChar->GetMLevel() >= 35 ? 2 : 1;
     const auto self = [&](const uint16 id) { return tryAbility(bot, packets, id, PChar, tick); };
-    if (held < most && self(ABILITY_TELLUS))
+    static constexpr std::array<uint16, 8> order = { ABILITY_IGNIS, ABILITY_GELUS, ABILITY_FLABRA, ABILITY_TELLUS,
+                                                     ABILITY_SULPOR, ABILITY_UNDA, ABILITY_LUX, ABILITY_TENEBRAE };
+    if (held < most)
     {
-        return true;
+        const auto start = static_cast<std::size_t>(PTarget->id % order.size());
+        if (self(order[(start + static_cast<std::size_t>(held)) % order.size()]))
+        {
+            return true;
+        }
     }
     if (held == 0)
     {
         return false;
     }
 
-    const bool hit = PTarget->GetBattleTarget() == PChar;
+    const bool hit      = PTarget->GetBattleTarget() == PChar;
+    const bool holdHate = PChar->PParty == nullptr || mainTank(PChar) == PChar;
     return (PChar->PAI->IsEngaged() && !PChar->StatusEffectContainer->HasStatusEffect(StatusEffect::Swordplay) && self(ABILITY_SWORDPLAY)) ||
            (hit && !PChar->StatusEffectContainer->HasStatusEffect({ StatusEffect::Vallation, StatusEffect::Valiance }) &&
-            (self(ABILITY_VALIANCE) || self(ABILITY_VALLATION))) ||
-           (hit && PChar->GetHPP() < 70 && !PChar->StatusEffectContainer->HasStatusEffect(StatusEffect::Pflug) && self(ABILITY_PFLUG));
+            (self(ABILITY_VALIANCE) || self(ABILITY_VALLATION) || self(ABILITY_LIEMENT))) ||
+           (hit && PChar->GetHPP() < 70 && !PChar->StatusEffectContainer->HasStatusEffect(StatusEffect::Pflug) && self(ABILITY_PFLUG)) ||
+           (hit && self(ABILITY_BATTUTA)) || (hit && PChar->GetHPP() < 40 && self(ABILITY_ONE_FOR_ALL)) ||
+           (hit && holdHate && (tryCast(bot, packets, SpellID::Foil, PChar, std::chrono::seconds(10), tick) ||
+                                tryCast(bot, packets, SpellID::Flash, PTarget, std::chrono::seconds(5), tick)));
 }
 
 // A monster mid-spell is bashed or stunned out of it, by whoever can.
@@ -2524,6 +2574,9 @@ auto act(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const bool tra
             case Job::SCH:
             case Job::PLD:
                 return heal(bot, packets, members, kEmergencyHPP, tick);
+            case Job::GEO:
+                return PChar->GetSJob() == Job::WHM && !partyHas(PChar, Job::WHM) && !partyHas(PChar, Job::RDM) && !partyHas(PChar, Job::SCH) &&
+                       heal(bot, packets, members, kEmergencyHPP, tick);
             default:
                 return false;
         }
@@ -2558,6 +2611,21 @@ auto act(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const bool tra
             break;
         case Job::PLD:
             if (heal(bot, packets, members, 40, tick))
+            {
+                return true;
+            }
+            break;
+        case Job::GEO:
+            // /WHM is the backup healer when the party has no White Mage, Red Mage or Scholar, at the red mage's line.
+            // Any other sub still only covers an emergency, the same as every other job.
+            if (PChar->GetSJob() == Job::WHM && !partyHas(PChar, Job::WHM) && !partyHas(PChar, Job::RDM) && !partyHas(PChar, Job::SCH))
+            {
+                if (heal(bot, packets, members, 60, tick))
+                {
+                    return true;
+                }
+            }
+            else if ((PChar->GetSJob() == Job::WHM || PChar->GetSJob() == Job::RDM) && heal(bot, packets, members, kEmergencyHPP, tick))
             {
                 return true;
             }
@@ -2656,7 +2724,9 @@ auto act(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const bool tra
         return true;
     }
 
-    if (!isCaster(job) && (PChar->PAI->IsEngaged() || isRanged(PChar)) && tryWeaponSkill(bot, packets, PTarget, tick))
+    // A geomancer with no party swings the club as well as nuking. In a party it stays a caster.
+    if ((!isCaster(job) || (job == Job::GEO && PChar->PParty == nullptr)) && (PChar->PAI->IsEngaged() || isRanged(PChar)) &&
+        tryWeaponSkill(bot, packets, PTarget, tick))
     {
         return true;
     }

@@ -2130,7 +2130,8 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
                 PChar->PAI->PathFind->LookAt(PTarget->loc.p);
             }
         }
-        else if (isCaster(PChar->GetMJob()) || isRanged(PChar))
+        // No party: a geomancer stands in with the club. In a party it keeps caster range.
+        else if ((isCaster(PChar->GetMJob()) && !(PChar->GetMJob() == xi::Job::GEO && PChar->PParty == nullptr)) || isRanged(PChar))
         {
             if (PChar->PAI->IsEngaged())
             {
