@@ -282,7 +282,7 @@ auto planGear(const xi::Job job, const uint8 level, const uint8 race) -> std::ar
 
         if (slots & (1 << SLOT_SUB))
         {
-            if (PItem->IsShield() && armourScore(PItem, job) > best[SLOT_SUB])
+            if (job != xi::Job::MNK && PItem->IsShield() && armourScore(PItem, job) > best[SLOT_SUB])
             {
                 best[SLOT_SUB] = armourScore(PItem, job);
                 plan[SLOT_SUB] = id;
@@ -532,10 +532,15 @@ void prepare(Bot& bot, sol::state& lua)
     {
         if (plan[slot] == 0)
         {
-            // Nothing better for the slot, but GM gear from before the GmOnly check still goes.
-            if (const auto* PWorn = PChar->getEquip(static_cast<SLOTTYPE>(slot)); PWorn != nullptr && PWorn->hasFlag(xi::ItemFlag::GmOnly))
+            // Clear disallowed GM gear and shields already equipped by a MNK.
+            if (const auto* PWorn = PChar->getEquip(static_cast<SLOTTYPE>(slot));
+                PWorn != nullptr && (PWorn->hasFlag(xi::ItemFlag::GmOnly) || (PChar->GetMJob() == xi::Job::MNK && PWorn->IsShield())))
             {
-                script += fmt::format("p:unequipItem({}); p:delItem({}, 1)\n", slot, PWorn->getID());
+                script += fmt::format("p:unequipItem({})\n", slot);
+                if (PWorn->hasFlag(xi::ItemFlag::GmOnly))
+                {
+                    script += fmt::format("p:delItem({}, 1)\n", PWorn->getID());
+                }
             }
             continue;
         }

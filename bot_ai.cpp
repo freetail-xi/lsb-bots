@@ -288,8 +288,10 @@ auto combatTarget(Bot& bot, CCharEntity* PChar, CCharEntity* PLeader) -> CBattle
     PChar->loc.zone->ForEachMob(
         [&](CMobEntity* PMob)
         {
-            if (!valid(PMob) || !PMob->PAI->IsEngaged() || distance(PChar->loc.p, PMob->loc.p) >= kThreatRange || !inParty(PChar, PMob->GetBattleTarget()) ||
-                beingPulled(PChar, PMob))
+            // Animation can leave Attack while the mob is performing an action; its battle target is the stable
+            // indication that it is still fighting someone in the party.
+            if (!valid(PMob) || distance(PChar->loc.p, PMob->loc.p) >= kThreatRange ||
+                !inParty(PChar, PMob->GetBattleTarget()) || beingPulled(PChar, PMob))
             {
                 return;
             }
