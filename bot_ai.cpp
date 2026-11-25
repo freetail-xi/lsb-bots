@@ -1722,6 +1722,19 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     {
         return;
     }
+
+    // A mob's charm gives the character LSB's own controller and a plain pathfinder, and the charm's end deletes
+    // that pathfinder (PathFind.reset(), since real players have none). Stand down while charmed, then give the
+    // bot its own pathfinder back, or every move after the charm reads a null PathFind.
+    if (PChar->isCharmed || PChar->PAI == nullptr)
+    {
+        return;
+    }
+    if (PChar->PAI->PathFind == nullptr)
+    {
+        PChar->PAI->PathFind = makePathFind(PChar);
+        ShowInfoFmt("bots: {} got its pathfinder back after a charm", bot.name);
+    }
     watchPull(PChar);
 
     if (PChar->isDead())
