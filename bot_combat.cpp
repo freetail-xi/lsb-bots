@@ -2976,6 +2976,9 @@ auto followOrder(Bot& bot, PacketSystem& packets, const timer::time_point tick) 
                 setCamp(PChar->PParty->GetLeader());
             }
             break;
+        case OrderKind::HeadOut:
+            askHeadOut(PChar);
+            break;
     }
 
     bot.order.reset();

@@ -21,7 +21,9 @@ xi.settings.bots =
     BOTS_PER_PLAYER_ZONE = 10, -- Bots outside a party kept in every zone a real player is in. 0 turns it off
     CAMP_CHANCE          = 70, -- Percent of logins that start at a camp for the bot's level instead of the pool home
     HUNT                 = true, -- Bots without a party hunt monsters near their level, in zones with real players
-    BOT_PARTIES          = true, -- Unpartied bots in a zone with real players sometimes team up and hunt together
+    BOT_PARTIES          = true, -- Unpartied bots in a zone with real players start a party and recruit up to six, then head to a camp
+    PARTY_LEVEL_SPREAD   = 3,  -- Levels. Every member stays within this of the leader's level when the party started (highest minus lowest at most twice this). Invites use it
+    PARTY_RECRUIT_MINUTES = 20, -- A party still short of 6 after this long disbands, and that leader waits this long before starting another. 0 never disbands
     SOLO_BELOW           = 10, -- Bots below this level solo in a starting area and are not put in bot-only parties. 0 turns this off
     SOLO_ACTIVE          = true, -- Those soloing bots hunt even when no real player is in their zone. false keeps them idle until one is, as before
 
@@ -38,7 +40,7 @@ xi.settings.bots =
     CITIZEN_SAY_MINUTES = 4,   -- About how often each citizen speaks in /say, and only with a real player within 30 yalms. 0 turns it off
 
     PLAYER_LEEWAY        = 40, -- Yalms. Bots leave a real player's mobs alone inside this, and aren't placed this close. They still fight back
-    LEVEL_WINDOW         = 10, -- Levels. Balance won't send a bot further than this from the player; invites use it, and logins prefer it
+    LEVEL_WINDOW         = 10, -- Levels. Balance won't send a bot further than this from the player, and logins prefer it. Invites use PARTY_LEVEL_SPREAD
 
     -- Chat through any OpenAI-style chat completions endpoint. Personalities are in bot_pool.personality.
     -- Default is the local llama-server (systemctl --user start lsb-chat). For a hosted API, e.g. OpenAI:
