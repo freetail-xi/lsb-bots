@@ -104,7 +104,7 @@ void sendAction(Bot& bot, PacketSystem& packets, const GP_CLI_COMMAND_ACTION_ACT
     // and that packet clears the animation before the action is sent.
     using enum GP_CLI_COMMAND_ACTION_ACTIONID;
     const bool blockedResting = actionId == Attack || actionId == CastMagic || actionId == JobAbility || actionId == Shoot || actionId == Weaponskill;
-    if (blockedResting && bot.entity() != nullptr)
+    if (blockedResting && bot.entity() != nullptr && bot.entity()->StatusEffectContainer != nullptr)
     {
         if (bot.entity()->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing))
         {
@@ -135,6 +135,10 @@ void acceptInvite(Bot& bot, PacketSystem& packets)
 // Ends a cutscene with its default choice, as a client skipping through it would.
 void finishEvent(Bot& bot, PacketSystem& packets, CCharEntity* PChar)
 {
+    if (PChar == nullptr || PChar->currentEvent == nullptr)
+    {
+        return;
+    }
     const auto* PTarget = PChar->currentEvent->targetEntity;
 
     auto  packet   = makePacket<GP_CLI_COMMAND_EVENTEND>();
@@ -969,13 +973,23 @@ void endHeadOut(Bot& bot, CCharEntity* PChar)
 // A member of a party already walking out copies the leader's camp onto the return path.
 void joinOuting(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, const timer::time_point tick)
 {
-    if (bot.returnUntil != timer::time_point{} || bot.nextHeadOut > tick || !partyIsBots(bot, PChar, botIds) || PChar->PParty->GetLeader() == PChar)
+    if (bot.returnUntil != timer::time_point{} || bot.nextHeadOut > tick || !partyIsBots(bot, PChar, botIds))
     {
         return;
     }
-    const auto it = outings.find(PChar->PParty->GetLeader()->id);
-    if (it == outings.end() || tick >= it->second.until)
+    auto* PLead = PChar->PParty->GetLeader();
+    if (PLead == nullptr || PLead == PChar)
     {
+        return;
+    }
+    const auto it = outings.find(PLead->id);
+    if (it == outings.end())
+    {
+        return;
+    }
+    if (tick >= it->second.until)
+    {
+        outings.erase(it);
         return;
     }
     bot.returnCamp  = it->second.place;
@@ -987,7 +1001,14 @@ void joinOuting(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, co
 void startHeadOut(Bot& bot, CCharEntity* PChar, const std::set<uint32>& botIds, const timer::time_point tick)
 {
     if (PChar->PParty == nullptr || PChar->PParty->GetLeader() != PChar || bot.returnUntil != timer::time_point{} || tick < bot.nextHeadOut ||
-        !partyIsBots(bot, PChar, botIds) || !notHunting(PChar) || hasPull(PChar))
+        !partyIsBots(bot, PChar, botIds) || !notHunting(PChar))
+    {
+        return;
+    }
+    // A pull left over from a zone this party has left (a wipe that ended in town) keeps hasPull true, and then
+    // this look never runs again. Drop only a pull for somewhere else; a camp in this zone stays.
+    dropCampIfLeft(PChar);
+    if (hasPull(PChar))
     {
         return;
     }
@@ -1154,6 +1175,13 @@ auto toolCount(CCharEntity* PChar, const uint16 itemId) -> int32
     return static_cast<int32>(charutils::getItemCount(PChar, itemId));
 }
 
+// -1 when the bag isn't there (a character mid zone-in). Callers stop or skip rather than dereference it.
+auto freeSlots(CCharEntity* PChar) -> int
+{
+    auto* PBag = PChar != nullptr ? PChar->getStorage(LOC_INVENTORY) : nullptr;
+    return PBag != nullptr ? static_cast<int>(PBag->GetFreeSlotsCount()) : -1;
+}
+
 void stopGather(Bot& bot, const timer::time_point tick, const char* reason)
 {
     if (!bot.gather)
@@ -1191,9 +1219,9 @@ void finishGather(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const tim
         stopGather(bot, tick, "5 minutes");
         return;
     }
-    if (PChar->getStorage(LOC_INVENTORY)->GetFreeSlotsCount() < kGatherFree)
+    if (const auto slots = freeSlots(PChar); slots < 0 || slots < kGatherFree)
     {
-        stopGather(bot, tick, "fewer than 3 free slots");
+        stopGather(bot, tick, slots < 0 ? "no inventory" : "fewer than 3 free slots");
         return;
     }
     if (left <= 0)
@@ -1229,6 +1257,10 @@ auto helmVisible(CNpcEntity* PNpc) -> bool
 
 auto npcById(CCharEntity* PChar, const uint32 id) -> CNpcEntity*
 {
+    if (PChar->loc.zone == nullptr)
+    {
+        return nullptr;
+    }
     CNpcEntity* found = nullptr;
     PChar->loc.zone->ForEachNpc(
         [&](CNpcEntity* PNpc)
@@ -1251,6 +1283,10 @@ struct HelmPick
 auto nearestHelm(CCharEntity* PChar) -> HelmPick
 {
     HelmPick best;
+    if (PChar->loc.zone == nullptr)
+    {
+        return best;
+    }
     float    bestDist = kGatherRange;
     PChar->loc.zone->ForEachNpc(
         [&](CNpcEntity* PNpc)
@@ -1286,7 +1322,7 @@ auto startGather(Bot& bot, CCharEntity* PChar, const timer::time_point tick) -> 
     }
 
     const auto chance = settings::get<uint32>("bots.GATHER_CHANCE");
-    if (PChar->getStorage(LOC_INVENTORY)->GetFreeSlotsCount() < kGatherFree)
+    if (freeSlots(PChar) < kGatherFree)
     {
         return false;
     }
@@ -1326,12 +1362,16 @@ auto startGather(Bot& bot, CCharEntity* PChar, const timer::time_point tick) -> 
 auto onGatherTrip(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const timer::time_point tick) -> bool
 {
     auto& trip = *bot.gather;
+    if (PChar->PAI == nullptr || PChar->PAI->PathFind == nullptr)
+    {
+        return true;
+    }
     if (tick >= trip.until)
     {
         stopGather(bot, tick, "5 minutes");
         return false;
     }
-    if (PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing))
+    if (PChar->StatusEffectContainer != nullptr && PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing))
     {
         stopGather(bot, tick, "resting");
         return false;
@@ -1388,9 +1428,9 @@ auto onGatherTrip(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const tim
     {
         return true;
     }
-    if (PChar->getStorage(LOC_INVENTORY)->GetFreeSlotsCount() < kGatherFree)
+    if (const auto slots = freeSlots(PChar); slots < 0 || slots < kGatherFree)
     {
-        stopGather(bot, tick, "fewer than 3 free slots");
+        stopGather(bot, tick, slots < 0 ? "no inventory" : "fewer than 3 free slots");
         return false;
     }
     if (bot.sitting)
@@ -1404,7 +1444,8 @@ auto onGatherTrip(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const tim
     }
 
     // Slot index for the trade, the same one useItem sends from SearchItem.
-    const auto slot = PChar->getStorage(LOC_INVENTORY)->SearchItem(trip.tool);
+    auto*      PBag = PChar->getStorage(LOC_INVENTORY);
+    const auto slot = PBag != nullptr ? PBag->SearchItem(trip.tool) : ERROR_SLOTID;
     if (slot == ERROR_SLOTID)
     {
         stopGather(bot, tick, "no tool left");
@@ -1429,7 +1470,7 @@ auto onGatherTrip(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const tim
     trip.tradedAt = tick;
 
     // The handler usually opens the event before send returns. End it now; the next think does it if not.
-    if (PChar->isInEvent() && PChar->currentEvent->eventId != kEntryEvent)
+    if (PChar->isInEvent() && PChar->currentEvent != nullptr && PChar->currentEvent->eventId != kEntryEvent)
     {
         finishGather(bot, packets, PChar, tick);
     }
@@ -1437,6 +1478,11 @@ auto onGatherTrip(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const tim
 }
 
 } // namespace
+
+void dropOuting(const uint32 charId)
+{
+    outings.erase(charId);
+}
 
 void emote(Bot& bot, PacketSystem& packets, const xi::Emote emote, const CBaseEntity* PTarget)
 {
@@ -1722,6 +1768,12 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
 
     if (PChar->loc.zone == nullptr || PChar->status == xi::Status::Disappear)
     {
+        // The trip lives on the bot, and the character is replaced on the next zone-in. Drop it here, before
+        // anything is sent: the point is in the zone they just left.
+        if (bot.gather)
+        {
+            stopGather(bot, tick, "zoning");
+        }
         return;
     }
     watchPull(PChar);
@@ -1730,6 +1782,11 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     {
         if (bot.gather)
         {
+            // Close the cutscene while the body is still in the zone. Homepoint is sent further down, after the wait.
+            if (bot.gather->waiting && PChar->isInEvent() && PChar->currentEvent != nullptr && PChar->currentEvent->eventId != kEntryEvent)
+            {
+                finishEvent(bot, packets, PChar);
+            }
             stopGather(bot, tick, "died");
         }
         if (bot.diedAt == timer::time_point{})
@@ -1789,6 +1846,10 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
 
     if (PChar->isInEvent())
     {
+        if (PChar->currentEvent == nullptr)
+        {
+            return;
+        }
         // A gather trade opened this. End it the same way as any other cutscene, then count the yield.
         // A battlefield menu, and any event the bot did not just trade for, stays on the path below.
         if (bot.gather && bot.gather->waiting && PChar->currentEvent->eventId != kEntryEvent)
@@ -1803,6 +1864,21 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         return;
     }
     bot.entryAnswered = false;
+
+    // Idle bots return before onGatherTrip, so a trade that never opened an event, or a trip past its
+    // five minutes, would otherwise sit on the bot until a player came back. Logout waits on a trade in flight.
+    if (bot.gather)
+    {
+        const bool tradePending = bot.gather->waiting && tick - bot.gather->tradedAt < kGatherEvent;
+        if (bot.gather->waiting && !tradePending)
+        {
+            stopGather(bot, tick, "no event");
+        }
+        else if (!tradePending && tick >= bot.gather->until)
+        {
+            stopGather(bot, tick, "5 minutes");
+        }
+    }
 
     // Bots may party among themselves, but one a real player has left breaks up.
     // A zoning player drops out of the party's member list for a moment, so only a real absence counts.
@@ -1932,7 +2008,7 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             else
             {
                 auto*      PFollow  = leaderOf(PChar);
-                const bool withLead = PFollow != nullptr && PFollow->getZone() == PChar->getZone() &&
+                const bool withLead = PFollow != nullptr && PFollow->loc.zone != nullptr && PFollow->getZone() == PChar->getZone() &&
                                       distance(PChar->loc.p, PFollow->loc.p) <= kFollowDistance + 3.0f;
                 arrived = atSpot || withLead;
             }
@@ -1964,7 +2040,10 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         {
             citizenPause(bot);
         }
-        PChar->PAI->PathFind->Clear();
+        if (PChar->PAI != nullptr && PChar->PAI->PathFind != nullptr)
+        {
+            PChar->PAI->PathFind->Clear();
+        }
         return;
     }
 
@@ -1976,11 +2055,12 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             travel(PChar, bot.returnCamp->zone, bot.returnCamp->pos);
         }
         else if (auto* PLead = leaderOf(PChar);
-                 PLead != nullptr && !PLead->isDead() && (PLead->getZone() == bot.returnCamp->zone || PLead->getZone() == PChar->getZone()))
+                 PLead != nullptr && PLead->loc.zone != nullptr && !PLead->isDead() &&
+                 (PLead->getZone() == bot.returnCamp->zone || PLead->getZone() == PChar->getZone()))
         {
             follow(PChar, PLead, tick);
         }
-        else
+        else if (PChar->PAI != nullptr && PChar->PAI->PathFind != nullptr)
         {
             PChar->PAI->PathFind->Clear();
         }
@@ -1996,11 +2076,12 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             walkTo(PChar, bot.returnCamp->pos, kHeadOutNear, tick);
         }
         else if (auto* PLead = leaderOf(PChar);
-                 PLead != nullptr && !PLead->isDead() && (PLead->getZone() == bot.returnCamp->zone || PLead->getZone() == PChar->getZone()))
+                 PLead != nullptr && PLead->loc.zone != nullptr && !PLead->isDead() &&
+                 (PLead->getZone() == bot.returnCamp->zone || PLead->getZone() == PChar->getZone()))
         {
             follow(PChar, PLead, tick);
         }
-        else
+        else if (PChar->PAI != nullptr && PChar->PAI->PathFind != nullptr)
         {
             PChar->PAI->PathFind->Clear();
         }

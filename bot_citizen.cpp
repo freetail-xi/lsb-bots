@@ -201,6 +201,10 @@ auto sayJitter(const uint32 minutes) -> std::chrono::seconds
 
 auto playerWithin(CCharEntity* PChar, const float range) -> bool
 {
+    if (PChar->loc.zone == nullptr)
+    {
+        return false;
+    }
     bool near = false;
     PChar->loc.zone->ForEachChar(
         [&](CCharEntity* POther)
@@ -221,6 +225,10 @@ auto playerWithin(CCharEntity* PChar, const float range) -> bool
 auto pickStop(Bot& bot, Routine& routine) -> bool
 {
     auto*                   PChar = bot.entity();
+    if (PChar == nullptr || PChar->loc.zone == nullptr)
+    {
+        return false;
+    }
     std::vector<CNpcEntity*> npcs;
     PChar->loc.zone->ForEachNpc(
         [&](CNpcEntity* PNpc)

@@ -592,7 +592,7 @@ void restock(Bot& bot, sol::state& lua, const timer::time_point tick)
 
     // Loot piles up until nothing fits, ammunition and medicine included; bots have no use for it.
     // A gathering trip keeps its tool and yield; the purge comes back once the trip is over.
-    if (auto* PBag = PChar->getStorage(LOC_INVENTORY); !bot.gather && PBag->GetFreeSlotsCount() < kBagSpare)
+    if (auto* PBag = PChar->getStorage(LOC_INVENTORY); PBag != nullptr && !bot.gather && PBag->GetFreeSlotsCount() < kBagSpare)
     {
         static const std::set<uint16> kKept = { kEchoDrops, kSilentOil, kPrismPowder, kAutomatonOil, static_cast<uint16>(ITEMID::SHIHEI) };
         for (uint8 slot = 1; slot <= PBag->GetSize(); ++slot)
