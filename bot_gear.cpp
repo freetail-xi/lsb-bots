@@ -515,9 +515,9 @@ void prepare(Bot& bot, sol::state& lua)
     std::string script = fmt::format("local p = GetPlayerByID({})\nif p == nil then return end\np:capAllSkills()\np:setNewPlayer(false)\n", PChar->id);
 
     // A full bag fails every addItem below without a word: a samurai never got its bow.
-    if (const auto size = PChar->getStorage(LOC_INVENTORY)->GetSize(); size < kBagSize)
+    if (const auto size = PChar->getStorage(xi::Container::Inventory)->GetSize(); size < kBagSize)
     {
-        script += fmt::format("p:changeContainerSize({}, {})\n", static_cast<uint8>(LOC_INVENTORY), kBagSize - size);
+        script += fmt::format("p:changeContainerSize({}, {})\n", static_cast<uint8>(xi::Container::Inventory), kBagSize - size);
     }
 
     // The dice for each roll; the game hands out a roll only once its level comes.
@@ -592,7 +592,7 @@ void restock(Bot& bot, sol::state& lua, const timer::time_point tick)
 
     // Loot piles up until nothing fits, ammunition and medicine included; bots have no use for it.
     // A gathering trip keeps its tool and yield; the purge comes back once the trip is over.
-    if (auto* PBag = PChar->getStorage(LOC_INVENTORY); !bot.gather && PBag->GetFreeSlotsCount() < kBagSpare)
+    if (auto* PBag = PChar->getStorage(xi::Container::Inventory); !bot.gather && PBag->GetFreeSlotsCount() < kBagSpare)
     {
         static const std::set<uint16> kKept = { kEchoDrops, kSilentOil, kPrismPowder, kAutomatonOil, static_cast<uint16>(ITEMID::SHIHEI) };
         for (uint8 slot = 1; slot <= PBag->GetSize(); ++slot)

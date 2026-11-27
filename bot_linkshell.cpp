@@ -44,7 +44,7 @@ auto wearing(const CCharEntity* PChar) -> bool
 // A pearl of the bots' linkshell in the inventory.
 auto findPearl(CCharEntity* PChar) -> CItemLinkshell*
 {
-    auto* PInventory = PChar->getStorage(LOC_INVENTORY);
+    auto* PInventory = PChar->getStorage(xi::Container::Inventory);
     for (uint8 slot = 0; slot <= PInventory->GetSize(); ++slot)
     {
         if (auto* PPearl = dynamic_cast<CItemLinkshell*>(PInventory->GetItem(slot)); PPearl != nullptr && PPearl->GetLSID() == shellId)

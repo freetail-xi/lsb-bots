@@ -1118,7 +1118,7 @@ class BotModule : public CPPModule
         // LSB runs xi.player.charCreate on any login without the New Adventurer title. Its starter gear only covers
         // the six starting jobs, so a bot created as any other job errors there on every login and never gets the
         // title (issue #3). Those bots are marked set up before the login packet; starting jobs get the normal first login.
-        constexpr uint16 kNewAdventurer = 206;
+        constexpr auto kNewAdventurer = xi::Title::NewAdventurer;
         const auto       mainJob        = PChar->GetMJob();
         const bool       startingJob    = mainJob == xi::Job::WAR || mainJob == xi::Job::MNK || mainJob == xi::Job::WHM || mainJob == xi::Job::BLM ||
                                  mainJob == xi::Job::RDM || mainJob == xi::Job::THF;

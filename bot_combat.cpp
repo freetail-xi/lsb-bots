@@ -165,7 +165,7 @@ auto restrained(const Bot& bot, CSpell* PSpell) -> bool
     }
 
     const auto family  = familyName(PSpell->getName());
-    const bool hostile = (PSpell->getValidTarget() & TARGET_ENEMY) != 0;
+    const bool hostile = (PSpell->getValidTarget() & xi::TargetType::Enemy) != xi::TargetType::None;
     const bool lasting = keptEffect(PSpell->getID()).has_value();
     const bool sleep   = isSleep(family);
     return std::ranges::contains(told.avoid, family) || ((told.restraints & kNoSleeps) && sleep) ||
@@ -2841,7 +2841,7 @@ auto followOrder(Bot& bot, PacketSystem& packets, const timer::time_point tick) 
         {
             // On the monster if it's that kind of ability, else on itself; a recast still running waits until the order expires.
             auto*          PAbility = ability::GetAbility(order.ability);
-            CBattleEntity* PTo      = PAbility != nullptr && (PAbility->getValidTarget() & TARGET_ENEMY) ? PMonster : PChar;
+            CBattleEntity* PTo      = PAbility != nullptr && (PAbility->getValidTarget() & xi::TargetType::Enemy) != xi::TargetType::None ? PMonster : PChar;
             if (PTo == nullptr)
             {
                 return false;
