@@ -1211,7 +1211,7 @@ void finishGather(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const tim
         stopGather(bot, tick, "5 minutes");
         return;
     }
-    if (PChar->getStorage(LOC_INVENTORY)->GetFreeSlotsCount() < kGatherFree)
+    if (PChar->getStorage(xi::Container::Inventory)->GetFreeSlotsCount() < kGatherFree)
     {
         stopGather(bot, tick, "fewer than 3 free slots");
         return;
@@ -1306,7 +1306,7 @@ auto startGather(Bot& bot, CCharEntity* PChar, const timer::time_point tick) -> 
     }
 
     const auto chance = settings::get<uint32>("bots.GATHER_CHANCE");
-    if (PChar->getStorage(LOC_INVENTORY)->GetFreeSlotsCount() < kGatherFree)
+    if (PChar->getStorage(xi::Container::Inventory)->GetFreeSlotsCount() < kGatherFree)
     {
         return false;
     }
@@ -1408,7 +1408,7 @@ auto onGatherTrip(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const tim
     {
         return true;
     }
-    if (PChar->getStorage(LOC_INVENTORY)->GetFreeSlotsCount() < kGatherFree)
+    if (PChar->getStorage(xi::Container::Inventory)->GetFreeSlotsCount() < kGatherFree)
     {
         stopGather(bot, tick, "fewer than 3 free slots");
         return false;
@@ -1424,7 +1424,7 @@ auto onGatherTrip(Bot& bot, PacketSystem& packets, CCharEntity* PChar, const tim
     }
 
     // Slot index for the trade, the same one useItem sends from SearchItem.
-    const auto slot = PChar->getStorage(LOC_INVENTORY)->SearchItem(trip.tool);
+    const auto slot = PChar->getStorage(xi::Container::Inventory)->SearchItem(trip.tool);
     if (slot == ERROR_SLOTID)
     {
         stopGather(bot, tick, "no tool left");
@@ -1504,7 +1504,7 @@ void useAbility(Bot& bot, PacketSystem& packets, const uint16 abilityId, const C
 auto useItem(Bot& bot, PacketSystem& packets, const uint16 itemId, const CBaseEntity* PTarget) -> bool
 {
     auto*      PChar = bot.entity();
-    const auto slot  = PChar->getStorage(LOC_INVENTORY)->SearchItem(itemId);
+    const auto slot  = PChar->getStorage(xi::Container::Inventory)->SearchItem(itemId);
     if (slot == ERROR_SLOTID)
     {
         return false;
@@ -1515,7 +1515,7 @@ auto useItem(Bot& bot, PacketSystem& packets, const uint16 itemId, const CBaseEn
     use->UniqueNo           = PTarget->id;
     use->ActIndex           = PTarget->targid;
     use->PropertyItemIndex  = slot;
-    use->Category           = LOC_INVENTORY;
+    use->Category           = static_cast<uint32>(xi::Container::Inventory);
     send(bot, packets, *packet);
     return true;
 }

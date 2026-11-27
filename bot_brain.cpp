@@ -920,7 +920,7 @@ auto keepFor(const Wanted& wanted, const std::string& target, CCharEntity* PSpea
     {
         return { KeepFor::Self, 0 };
     }
-    if (PSpell->getValidTarget() & TARGET_ENEMY)
+    if ((PSpell->getValidTarget() & xi::TargetType::Enemy) != xi::TargetType::None)
     {
         return { KeepFor::Monster, 0 };
     }
@@ -943,7 +943,7 @@ auto keepFor(const Wanted& wanted, const std::string& target, CCharEntity* PSpea
         const bool mage = job == Job::WHM || job == Job::BLM || job == Job::RDM || job == Job::BRD || job == Job::SMN || job == Job::SCH || job == Job::GEO;
         return { mage ? KeepFor::Mages : KeepFor::Melee, 0 };
     }
-    if ((PSpell->getValidTarget() & (TARGET_PLAYER_PARTY | TARGET_PLAYER_PARTY_PIANISSIMO)) == 0)
+    if ((PSpell->getValidTarget() & (xi::TargetType::PlayerParty | xi::TargetType::PlayerPartyPianissimo)) == xi::TargetType::None)
     {
         return { KeepFor::Self, 0 };
     }
@@ -1205,7 +1205,7 @@ auto plansFor(const std::vector<ToolCall>& calls, const std::string& text, CChar
 
             const auto* PFirst    = wanted->ladder.empty() ? nullptr : spell::GetSpell(wanted->ladder.front());
             const auto  target    = lowered(arg("target"));
-            const bool  onMonster = target == "monster" || (PFirst != nullptr && (PFirst->getValidTarget() & TARGET_ENEMY));
+            const bool  onMonster = target == "monster" || (PFirst != nullptr && (PFirst->getValidTarget() & xi::TargetType::Enemy) != xi::TargetType::None);
 
             // The named bot if it can, else the best one that can, else the reason nobody can.
             auto* bot = named;
